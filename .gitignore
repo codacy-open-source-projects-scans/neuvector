@@ -1,0 +1,7 @@
+# vi temporary files
+.*.swp
+.vscode
+*.code-workspace
+*.bak
+
+db/*.db
