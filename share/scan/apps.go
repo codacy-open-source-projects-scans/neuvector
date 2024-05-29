@@ -57,7 +57,7 @@ const (
 	golang = "golang"
 
 	// R language
-	rlang = "r"
+	rlang           = "r"
 	rDefaultPath    = "usr/lib/R/library/"
 	rDefaultPath2   = "usr/local/lib/R/library/"
 	rRepositoryPath = "usr/local/lib/R/site-library/"
@@ -176,7 +176,8 @@ func (s *ScanApps) ExtractAppPkg(filename, fullpath string) {
 		s.parseNodePackage(filename, fullpath)
 	} else if IsJava(filename) {
 		if r, err := zip.OpenReader(fullpath); err == nil {
-			s.parseJarPackage(r.Reader, filename, filename, fullpath, 0)
+			dedup := utils.NewSet()
+			s.parseJarPackage(r.Reader, filename, filename, fullpath, 0, dedup)
 			r.Close()
 		} else {
 			log.WithFields(log.Fields{"err": err}).Error("open jar file fail")
@@ -419,7 +420,7 @@ func parseJarManifestFile(path string, rc io.Reader) (*AppPackage, error) {
 	}
 
 	// Suppress incomplete entries as we can't use them later.
-	if title == "" || version == "" {
+	if title == "" || title == "jar" || version == "" {
 		return nil, errors.New("Missing title or version")
 	}
 
@@ -433,7 +434,8 @@ func parseJarManifestFile(path string, rc io.Reader) (*AppPackage, error) {
 	return &pkg, nil
 }
 
-func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath string, depth int) {
+func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath string, depth int, dedup utils.Set) {
+	// in-memory unzip the jar file then walk through.
 	tempDir, err := ioutil.TempDir("", "")
 	if err == nil {
 		defer os.RemoveAll(tempDir)
@@ -447,21 +449,24 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath str
 		path = origJar + ":" + filename
 	}
 
+	doneWithFileParsing := false
 	pkgs := make(map[string][]AppPackage)
 	for _, f := range r.File {
 		if f.FileInfo().IsDir() {
 			continue
 		}
-		if depth+1 < jarMaxDepth && IsJava(f.Name) {
+		if IsJava(f.Name) {
+			if depth+1 >= jarMaxDepth {
+				continue
+			}
 			// Parse jar file recursively
 			if jarFile, err := f.Open(); err == nil {
-				// Unzip the jar file to disk then walk through. Can we unzip on the fly?
 				dstPath := filepath.Join(tempDir, filepath.Base(f.Name)) // retain the filename
 				if dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode()); err == nil {
 					if _, err := io.Copy(dstFile, jarFile); err == nil {
 						dstFile.Close()
 						if jarReader, err := zip.OpenReader(dstPath); err == nil {
-							s.parseJarPackage(jarReader.Reader, origJar, f.Name, dstPath, depth+1)
+							s.parseJarPackage(jarReader.Reader, origJar, f.Name, dstPath, depth+1, dedup)
 							jarReader.Close()
 						}
 					} else {
@@ -479,7 +484,7 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath str
 			} else {
 				log.WithFields(log.Fields{"fullpath": fullpath, "filename": filename, "depth": depth, "err": err}).Error("open jar file fail")
 			}
-		} else if strings.HasSuffix(f.Name, javaPOMproperty) {
+		} else if !doneWithFileParsing && strings.HasSuffix(f.Name, javaPOMproperty) {
 			var groupId, version, artifactId string
 			rc, err := f.Open()
 			if err != nil {
@@ -506,7 +511,7 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath str
 
 			rc.Close()
 
-			if groupId == "" || version == "" || artifactId == "" {
+			if groupId == "" || version == "" || artifactId == "" || artifactId == "jar" {
 				log.WithFields(log.Fields{"path": path}).Info("Missing artifactId, groupId, or version")
 				continue
 			}
@@ -517,14 +522,12 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath str
 				ModuleName: fmt.Sprintf("%s:%s", groupId, artifactId),
 				Version:    version,
 			}
-			if _, ok := pkgs[path]; !ok {
-				pkgs[path] = []AppPackage{pkg}
-			} else {
-				pkgs[path] = append(pkgs[path], pkg)
-			}
 
-			continue //higher priority
-		} else if strings.HasSuffix(f.Name, javaManifest) {
+			key := fmt.Sprintf("%s-%s-%s", pkg.FileName, pkg.ModuleName, pkg.Version)
+			dedup.Add(key)                 // reference
+			pkgs[path] = []AppPackage{pkg} // higher priority: replace others
+			doneWithFileParsing = true     // No need to parse other manifest files of the same jar file
+		} else if !doneWithFileParsing && strings.HasSuffix(f.Name, javaManifest) {
 			rc, err := f.Open()
 			if err != nil {
 				log.WithFields(log.Fields{"err": err}).Error("open manifest file fail")
@@ -532,10 +535,14 @@ func (s *ScanApps) parseJarPackage(r zip.Reader, origJar, filename, fullpath str
 			}
 
 			if pkg, err := parseJarManifestFile(path, rc); err == nil {
-				if _, ok := pkgs[path]; !ok {
-					pkgs[path] = []AppPackage{*pkg}
-				} else {
-					pkgs[path] = append(pkgs[path], *pkg)
+				key := fmt.Sprintf("%s-%s-%s", pkg.FileName, pkg.ModuleName, pkg.Version)
+				if !dedup.Contains(key) {
+					dedup.Add(key)
+					if _, ok := pkgs[path]; !ok {
+						pkgs[path] = []AppPackage{*pkg}
+					} else {
+						pkgs[path] = append(pkgs[path], *pkg)
+					}
 				}
 			}
 
@@ -751,7 +758,7 @@ func (s *ScanApps) parseDotNetPackage(filename, fullpath string) {
 			}
 
 			for app, v := range dep.Deps {
-				key := fmt.Sprintf("%s-%s", ".NET:" + app, v)
+				key := fmt.Sprintf("%s-%s", ".NET:"+app, v)
 				if !dedup.Contains(key) {
 					dedup.Add(key)
 					pkg := AppPackage{
@@ -819,11 +826,11 @@ func (s *ScanApps) parseRLangPackage(filename, fullpath string) {
 		} else {
 			rname = fmt.Sprintf("%s-%s", repository, name)
 		}
-		pkg := AppPackage {
+		pkg := AppPackage{
 			AppName:    rlang,
 			ModuleName: strings.ToLower(rname),
 			Version:    version,
-			FileName:   strings.TrimSuffix(filename, "/"+ rDescFileName),
+			FileName:   strings.TrimSuffix(filename, "/"+rDescFileName),
 		}
 		s.pkgs[filename] = []AppPackage{pkg}
 	}
