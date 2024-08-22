@@ -382,6 +382,7 @@ type RESTServerOIDC struct {
 	DefaultRole      string                    `json:"default_role"`
 	RoleGroups       map[string][]string       `json:"role_groups,omitempty"`        // role -> groups
 	GroupMappedRoles []*share.GroupRoleMapping `json:"group_mapped_roles,omitempty"` // group -> (role -> domains)
+	UseProxy         bool                      `json:"use_proxy,omitempty"`
 }
 
 type RESTServer struct {
@@ -465,6 +466,7 @@ type RESTServerOIDCConfig struct {
 	DefaultRole      *string                    `json:"default_role"`
 	RoleGroups       *map[string][]string       `json:"role_groups,omitempty"`        // role -> groups. deprecated since 4.2
 	GroupMappedRoles *[]*share.GroupRoleMapping `json:"group_mapped_roles,omitempty"` // group -> (role -> domains)
+	UseProxy         *bool                      `json:"use_proxy"`
 }
 
 type RESTServerOIDCConfigCfgMap struct {
@@ -622,7 +624,8 @@ type RESTSelfUserData struct {
 	PwdDaysUntilExpire  int                              `json:"password_days_until_expire"`  // negative means password never expires
 	PwdHoursUntilExpire int                              `json:"password_hours_until_expire"` // the hours part beyond PwdDaysUntilExpire, 0 ~ 23
 	GlobalPermits       []*RESTRolePermission            `json:"global_permissions,omitempty"`
-	DomainPermits       map[string][]*RESTRolePermission `json:"domain_permissions,omitempty"` // domain -> permissions
+	DomainPermits       map[string][]*RESTRolePermission `json:"domain_permissions,omitempty"`        // domain -> permissions
+	RemoteGlobalPermits []*RESTRolePermission            `json:"remote_global_permissions,omitempty"` // for accessing managed clusters on primary cluster's UI
 }
 
 type RESTUserConfigData struct {
@@ -1471,6 +1474,7 @@ type RESTAgentConfig struct {
 	Debug            *[]string `json:"debug,omitempty"`
 	DisableNvProtect *bool     `json:"disable_nvprotect,omitempty"`
 	DisableKvCCtl    *bool     `json:"disable_kvcctl,omitempty"`
+	SyslogLevel      *string   `json:"syslog_level,omitempty"`
 }
 
 type RESTAgentConfigData struct {
@@ -1759,12 +1763,16 @@ type RESTSystemConfigConfig struct {
 	RegistryHttpsProxyEnable  *bool                            `json:"registry_https_proxy_status,omitempty"`
 	RegistryHttpProxy         *RESTProxy                       `json:"registry_http_proxy,omitempty"`
 	RegistryHttpsProxy        *RESTProxy                       `json:"registry_https_proxy,omitempty"`
+	RegistryHttpProxyCfg      *RESTProxyConfig                 `json:"registry_http_proxy_cfg,omitempty"`
+	RegistryHttpsProxyCfg     *RESTProxyConfig                 `json:"registry_https_proxy_cfg,omitempty"`
 	IBMSAEpEnabled            *bool                            `json:"ibmsa_ep_enabled,omitempty"`
 	IBMSAEpDashboardURL       *string                          `json:"ibmsa_ep_dashboard_url,omitempty"`
 	XffEnabled                *bool                            `json:"xff_enabled,omitempty"`
 	ScannerAutoscale          *RESTSystemConfigAutoscaleConfig `json:"scanner_autoscale,omitempty"`
 	NoTelemetryReport         *bool                            `json:"no_telemetry_report,omitempty"`
 	RemoteRepositories        *[]RESTRemoteRepository          `json:"remote_repositories,omitempty"`
+	EnableTLSVerification     *bool                            `json:"enable_tls_verification,omitempty"`
+	GlobalCaCerts             *[]string                        `json:"cacerts,omitempty"`
 	// InternalSubnets      *[]string `json:"configured_internal_subnets,omitempty"`
 }
 
@@ -1830,10 +1838,17 @@ type RESTSystemConfigAuthCfgV2 struct {
 }
 
 type RESTSystemConfigProxyCfgV2 struct {
-	RegistryHttpProxyEnable  *bool      `json:"registry_http_proxy_status,omitempty"`
-	RegistryHttpsProxyEnable *bool      `json:"registry_https_proxy_status,omitempty"`
-	RegistryHttpProxy        *RESTProxy `json:"registry_http_proxy,omitempty"`
-	RegistryHttpsProxy       *RESTProxy `json:"registry_https_proxy,omitempty"`
+	RegistryHttpProxyEnable  *bool            `json:"registry_http_proxy_status,omitempty"`
+	RegistryHttpsProxyEnable *bool            `json:"registry_https_proxy_status,omitempty"`
+	RegistryHttpProxy        *RESTProxy       `json:"registry_http_proxy,omitempty"`
+	RegistryHttpsProxy       *RESTProxy       `json:"registry_https_proxy,omitempty"`
+	RegistryHttpProxyCfg     *RESTProxyConfig `json:"registry_http_proxy_cfg,omitempty"`
+	RegistryHttpsProxyCfg    *RESTProxyConfig `json:"registry_https_proxy_cfg,omitempty"`
+}
+
+type RESTSystemConfigTlsCfg struct {
+	EnableTLSVerification *bool     `json:"enable_tls_verification"`
+	GlobalCaCerts         *[]string `json:"cacerts"`
 }
 
 type RESTSystemConfigMiscCfgV2 struct {
@@ -1856,6 +1871,7 @@ type RESTSystemConfigConfigV2 struct {
 	SyslogCfg          *RESTSystemConfigSyslogCfgV2     `json:"syslog_cfg,omitempty"`
 	AuthCfg            *RESTSystemConfigAuthCfgV2       `json:"auth_cfg,omitempty"`
 	ProxyCfg           *RESTSystemConfigProxyCfgV2      `json:"proxy_cfg,omitempty"`
+	TlsCfg             *RESTSystemConfigTlsCfg          `json:"tls_cfg,omitempty"`
 	Webhooks           *[]*RESTWebhook                  `json:"webhooks,omitempty"`
 	IbmsaCfg           *RESTSystemConfigIBMSAVCfg2      `json:"ibmsa_cfg,omitempty"`
 	ScannerAutoscale   *RESTSystemConfigAutoscaleConfig `json:"scanner_autoscale_cfg,omitempty"`
@@ -1876,6 +1892,12 @@ type RESTSystemRequest struct {
 
 type RESTSystemRequestData struct {
 	Request *RESTSystemRequest `json:"request"`
+}
+
+type RESTProxyConfig struct {
+	URL      *string `json:"url"`
+	Username *string `json:"username"`
+	Password *string `json:"password,cloak"`
 }
 
 // If more log servers needed, they can be defined as servers.
@@ -1923,6 +1945,8 @@ type RESTSystemConfig struct {
 	NoTelemetryReport         bool                      `json:"no_telemetry_report"`
 	CspType                   string                    `json:"csp_type"`
 	RemoteRepositories        []RESTRemoteRepository    `json:"remote_repositories"`
+	EnableTLSVerification     bool                      `json:"enable_tls_verification"`
+	GlobalCaCerts             []string                  `json:"cacerts"`
 }
 
 type RESTSystemConfigData struct {
@@ -1981,10 +2005,12 @@ type RESTSystemConfigAutoscale struct {
 }
 
 type RESTSystemConfigProxyV2 struct {
-	RegistryHttpProxyEnable  bool      `json:"registry_http_proxy_status"`
-	RegistryHttpsProxyEnable bool      `json:"registry_https_proxy_status"`
-	RegistryHttpProxy        RESTProxy `json:"registry_http_proxy"`
-	RegistryHttpsProxy       RESTProxy `json:"registry_https_proxy"`
+	RegistryHttpProxyEnable  bool            `json:"registry_http_proxy_status"`
+	RegistryHttpsProxyEnable bool            `json:"registry_https_proxy_status"`
+	RegistryHttpProxy        RESTProxy       `json:"registry_http_proxy"`
+	RegistryHttpsProxy       RESTProxy       `json:"registry_https_proxy"`
+	RegistryHttpProxyCfg     RESTProxyConfig `json:"registry_http_proxy_cfg"`
+	RegistryHttpsProxyCfg    RESTProxyConfig `json:"registry_https_proxy_cfg"`
 }
 
 type RESTSystemConfigIBMSAV2 struct {
@@ -2008,6 +2034,11 @@ type RESTSystemConfigModeAutoV2 struct {
 	ModeAutoM2PDuration int64 `json:"mode_auto_m2p_duration"`
 }
 
+type RESTSystemConfigTls struct {
+	EnableTLSVerification bool     `json:"enable_tls_verification"`
+	GlobalCaCerts         []string `json:"cacerts"`
+}
+
 type RESTSystemConfigV2 struct {
 	NewSvc             RESTSystemConfigNewSvcV2   `json:"new_svc"`
 	Syslog             RESTSystemConfigSyslogV2   `json:"syslog"`
@@ -2020,6 +2051,7 @@ type RESTSystemConfigV2 struct {
 	ModeAuto           RESTSystemConfigModeAutoV2 `json:"mode_auto"`
 	ScannerAutoscale   RESTSystemConfigAutoscale  `json:"scanner_autoscale"`
 	RemoteRepositories []RESTRemoteRepository     `json:"remote_repositories"`
+	TlsCfg             RESTSystemConfigTls        `json:"tls_cfg"`
 }
 
 type RESTIBMSAConfig struct {
@@ -4003,6 +4035,7 @@ type RESTWorkloadAssetView struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	Domain          string   `json:"domain"`
+	Image           string   `json:"image"`
 	Applications    []string `json:"applications"`
 	PolicyMode      string   `json:"policy_mode"`
 	ServiceGroup    string   `json:"service_group"`
@@ -4109,4 +4142,8 @@ type AssetCVECount struct {
 	High        int    `json:"high"`
 	Medium      int    `json:"medium"`
 	Low         int    `json:"low"`
+}
+
+type RESTAssetIDList struct {
+	IDs []string `json:"ids"`
 }

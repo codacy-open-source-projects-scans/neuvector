@@ -3101,7 +3101,7 @@ func (h *nvCrdHandler) parseCrdContent(kind string, crdSecRule interface{}, reco
 		}
 	}
 	if errCount > 0 {
-		log.Printf("CRD validate fail : %s\n", errMsg)
+		log.Printf("CRD validate fail : %s", errMsg)
 	}
 
 	return crdCfgRet, errCount, errMsg, recordName
@@ -3794,7 +3794,7 @@ func CrossCheckCrd(kind, rscType, kvCrdKind, lockKey string, kvOnly bool) error 
 	var imported, deleted []string
 
 	recordList := clusHelper.GetCrdSecurityRuleRecordList(kvCrdKind)
-	objs, err = global.ORCH.ListResource(rscType)
+	objs, err = global.ORCH.ListResource(rscType, "")
 	if err != nil {
 		log.WithFields(log.Fields{"rscType": rscType, "err": err}).Error()
 		return err

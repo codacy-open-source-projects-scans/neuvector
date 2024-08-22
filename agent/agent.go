@@ -248,11 +248,11 @@ func main() {
 	var err error
 
 	log.SetOutput(os.Stdout)
-	log.SetLevel(log.InfoLevel)
+	log.SetLevel(share.CLUSGetSyslogLevel(gInfo.agentConfig.SyslogLevel))
 	log.SetFormatter(&utils.LogFormatter{Module: "AGT"})
 
 	connLog.Out = os.Stdout
-	connLog.Level = log.InfoLevel
+	connLog.Level = share.CLUSGetSyslogLevel(gInfo.agentConfig.SyslogLevel)
 	connLog.Formatter = &utils.LogFormatter{Module: "AGT"}
 
 	log.WithFields(log.Fields{"version": Version}).Info("START")
@@ -283,16 +283,25 @@ func main() {
 	policy_puller := flag.Int("policy_puller", 0, "set policy pulling period")
 	autoProfile := flag.Int("apc", 1, "Enable auto profile collection")
 	custom_check_control := flag.String("cbench", share.CustomCheckControl_Disable, "Custom check control")
+	syslog_level := flag.String("enf_syslog_level", share.SyslogLevel_Info, "Enforcer syslog level")
 	flag.Parse()
 
+	// debug setting will overrite syslog_level setting
 	if *debug {
 		log.SetLevel(log.DebugLevel)
 		gInfo.agentConfig.Debug = []string{"ctrl"}
+	} else if *syslog_level != "" && *syslog_level != gInfo.agentConfig.SyslogLevel {
+		gInfo.agentConfig.SyslogLevel = *syslog_level
+		log.SetLevel(share.CLUSGetSyslogLevel(gInfo.agentConfig.SyslogLevel))
+		connLog.Level = share.CLUSGetSyslogLevel(gInfo.agentConfig.SyslogLevel)
+		if *syslog_level == share.SyslogLevel_Debug {
+			gInfo.agentConfig.Debug = []string{"ctrl"}
+		}
 	}
 
 	if *debug_level != "" {
 		levels := utils.NewSetFromSliceKind(append(gInfo.agentConfig.Debug, strings.Split(*debug_level, " ")...))
-		if !*debug && levels.Contains("ctrl") {
+		if !*debug && *syslog_level != share.SyslogLevel_Debug && levels.Contains("ctrl") {
 			levels.Remove("ctrl")
 		}
 		gInfo.agentConfig.Debug = levels.ToStringSlice()
@@ -519,7 +528,7 @@ func main() {
 		ctx, internalCertControllerCancel = context.WithCancel(context.Background())
 		defer internalCertControllerCancel()
 		// Initialize secrets.  Most of services are not running at this moment, so skip their reload functions.
-		err = migration.InitializeInternalSecretController(ctx, []func([]byte, []byte, []byte) error{
+		capable, err := migration.InitializeInternalSecretController(ctx, []func([]byte, []byte, []byte) error{
 			// Reload consul
 			func(cacert []byte, cert []byte, key []byte) error {
 				log.Info("Reloading consul config")
@@ -542,7 +551,16 @@ func main() {
 			log.WithError(err).Error("failed to initialize internal secret controller")
 			os.Exit(-2)
 		}
-		log.Info("internal certificate is initialized")
+		if capable {
+			log.Info("internal certificate is initialized")
+		} else {
+			if os.Getenv("NO_FALLBACK") == "" {
+				log.Warn("required permission is missing...fallback to the built-in certificate if it exists")
+			} else {
+				log.Error("required permission is missing...ending now")
+				os.Exit(-2)
+			}
+		}
 	}
 
 	err = cluster.ReloadInternalCert()
@@ -656,7 +674,7 @@ func main() {
 		WalkHelper:           walkerTask,
 	}
 
-	if prober, err = probe.New(&probeConfig); err != nil {
+	if prober, err = probe.New(&probeConfig, gInfo.agentConfig.SyslogLevel); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Failed to probe. Exit!")
 		os.Exit(-2)
 	}
@@ -674,7 +692,7 @@ func main() {
 		EstRule:        cbEstimateFileAlertByGroup,
 	}
 
-	if fileWatcher, err = fsmon.NewFileWatcher(&fmonConfig); err != nil {
+	if fileWatcher, err = fsmon.NewFileWatcher(&fmonConfig, gInfo.agentConfig.SyslogLevel); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Failed to open file monitor!")
 		os.Exit(-2)
 	}
@@ -690,7 +708,7 @@ func main() {
 		bench.ResetDockerStatus()
 	}
 	if !Host.CapKubeBench {
-			// If the older version write status into the cluster, clear it.
+		// If the older version write status into the cluster, clear it.
 		bench.ResetKubeStatus()
 	}
 
