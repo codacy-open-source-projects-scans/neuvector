@@ -865,14 +865,14 @@ func LoadInitCfg(load bool, platform string) bool {
 	}
 
 	configMaps := []configMap{
-		configMap{FileName: eulaconfigmap, Type: "eula", HandlerFunc: handleeulacfg},
-		configMap{FileName: roleconfigmap, Type: "role", HandlerFunc: handlecustomrolecfg},                   // must be before user/ldap/saml/oidc
-		configMap{FileName: pwdprofileconfigmap, Type: "password profile", HandlerFunc: handlepwdprofilecfg}, // must be before user
-		configMap{FileName: ldapconfigmap, Type: "ldap", HandlerFunc: handleldapcfg},
-		configMap{FileName: samlconfigmap, Type: "saml", HandlerFunc: handlesamlcfg},
-		configMap{FileName: oidcconfigmap, Type: "oidc", HandlerFunc: handleoidccfg},
-		configMap{FileName: syscfgconfigmap, Type: "system", HandlerFunc: handlesystemcfg},
-		configMap{FileName: authconfigmap, Type: "auth", HandlerFunc: handleusercfg},
+		{FileName: eulaconfigmap, Type: "eula", HandlerFunc: handleeulacfg},
+		{FileName: roleconfigmap, Type: "role", HandlerFunc: handlecustomrolecfg},                   // must be before user/ldap/saml/oidc
+		{FileName: pwdprofileconfigmap, Type: "password profile", HandlerFunc: handlepwdprofilecfg}, // must be before user
+		{FileName: ldapconfigmap, Type: "ldap", HandlerFunc: handleldapcfg},
+		{FileName: samlconfigmap, Type: "saml", HandlerFunc: handlesamlcfg},
+		{FileName: oidcconfigmap, Type: "oidc", HandlerFunc: handleoidccfg},
+		{FileName: syscfgconfigmap, Type: "system", HandlerFunc: handlesystemcfg},
+		{FileName: authconfigmap, Type: "auth", HandlerFunc: handleusercfg},
 	}
 
 	if clusHelper == nil {
@@ -884,10 +884,10 @@ func LoadInitCfg(load bool, platform string) bool {
 	context.platform = platform
 	for _, configMap := range configMaps {
 		// check whether we need to retry loading configmap when it failed in the last loading
-		if tried, _ := cfgmapTried[configMap.Type]; tried >= 6 {
+		if tried := cfgmapTried[configMap.Type]; tried >= 6 {
 			cfgmapTried[configMap.Type] = -2 // no need to retry loading this config
 		}
-		tried, _ := cfgmapTried[configMap.Type]
+		tried := cfgmapTried[configMap.Type]
 		if tried < 0 {
 			continue
 		}
