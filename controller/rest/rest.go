@@ -26,7 +26,7 @@ import (
 
 	"errors"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt/v5"
 	"sigs.k8s.io/yaml"
 
 	"github.com/hashicorp/go-version"
@@ -1493,6 +1493,36 @@ func PreInitContext(ctx *Context) {
 	cfgHelper = kv.GetConfigHelper()
 }
 
+func initSearchRegistries(ctx *Context) {
+	searchRegistries = utils.NewSet()
+
+	for _, reg := range strings.Split(ctx.SearchRegistries, ",") {
+		reg = strings.Trim(reg, " ")
+		if len(reg) > 0 {
+			parsedReg, err := url.Parse(reg)
+			if err != nil {
+				log.WithError(err).WithFields(log.Fields{"registry": reg}).Warn("unable to parse registry")
+				continue
+			}
+			var regURL string
+			if parsedReg.Scheme == "" {
+				// when scheme is not specified in reg, host is in parsedReg.Path
+				path := parsedReg.Path
+				if i := strings.Index(parsedReg.Path, "/"); i > 0 {
+					path = parsedReg.Path[:i]
+				}
+				regURL = fmt.Sprintf("https://%s/", path)
+			} else {
+				// when scheme is specified in reg, host is in parsedReg.Host
+				regURL = fmt.Sprintf("%s://%s/", parsedReg.Scheme, parsedReg.Host)
+			}
+			if !searchRegistries.Contains(regURL) {
+				searchRegistries.Add(regURL)
+			}
+		}
+	}
+}
+
 // InitContext() must be called before StartRESTServer(), StartFedRestServer or AdmissionRestServer()
 func InitContext(ctx *Context) {
 
@@ -1516,28 +1546,13 @@ func InitContext(ctx *Context) {
 		log.WithError(err).Error("failed to initialize keys/certificates.")
 	}
 
-	searchRegistries = utils.NewSet()
-
-	for _, reg := range strings.Split(ctx.SearchRegistries, ",") {
-		if parsedReg, err := url.Parse(reg); err != nil {
-			log.WithError(err).WithFields(log.Fields{"registry": reg}).Warn("unable to parse registry")
-			continue
-		} else if parsedReg.Host != "" {
-			reg = parsedReg.Host
-		}
-
-		k := fmt.Sprintf("https://%s/", strings.Trim(reg, " "))
-		if !searchRegistries.Contains(k) {
-			searchRegistries.Add(k)
-		}
-	}
+	initSearchRegistries(ctx)
 
 	initHttpClients()
 }
 
 func StartRESTServer(isNewCluster bool, isLead bool) {
 	initDefaultRegistries()
-	licenseInit()
 	newRepoScanMgr()
 	newRegTestMgr()
 
@@ -1612,9 +1627,6 @@ func StartRESTServer(isNewCluster bool, isLead bool) {
 	r.PATCH("/v1/system/config/webhook/:name", handlerSystemWebhookConfig)  // supported 'scope' query parameter values: "fed"/"local"(default).
 	r.DELETE("/v1/system/config/webhook/:name", handlerSystemWebhookDelete) // supported 'scope' query parameter values: "fed"/"local"(default).
 	r.POST("/v1/system/request", handlerSystemRequest)
-	r.GET("/v1/system/license", handlerLicenseShow)
-	r.POST("/v1/system/license/update", handlerLicenseUpdate)
-	r.DELETE("/v1/system/license", handlerLicenseDelete)
 	r.GET("/v1/domain", handlerDomainList)
 	r.PATCH("/v1/domain", handlerDomainConfig)
 	r.PATCH("/v1/domain/:name", handlerDomainEntryConfig)
