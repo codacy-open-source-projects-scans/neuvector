@@ -67,8 +67,13 @@ func (r *jfrog) Login(cfg *share.CLUSRegistryConfig) (error, string) {
 		r.subdomainURL = make(map[string]string)
 	}
 
-	r.newRegClient(cfg.Registry, cfg.Username, cfg.Password)
-	r.rc.Alive()
+	if err := r.newRegClient(cfg.Registry, cfg.Username, cfg.Password); err != nil {
+		return err, err.Error()
+	}
+
+	if _, err := r.rc.Alive(); err != nil {
+		return err, err.Error()
+	}
 	return nil, ""
 }
 
@@ -211,6 +216,18 @@ func getSubdomainFromRepo(repo string) (string, string) {
 	return "", ""
 }
 
+// GetArtifactoryTags is designed to work with a new API endpoint provided by JFrog.
+func (r *jfrog) GetArtifactoryTags(repositoryStr string, rc *scanUtils.RegClient) ([]string, error) {
+	tags := make([]string, 0)
+	key, repository, found := strings.Cut(repositoryStr, "/")
+	if !found {
+		return tags, fmt.Errorf("invalid repository format: %v", repositoryStr)
+	}
+
+	url := r.url("/artifactory/api/docker/%s/v2/%s/tags/list", key, repository)
+	return rc.FetchTagsPaginated(url, repositoryStr)
+}
+
 func (r *jfrog) GetTagList(domain, repo, tag string) ([]string, error) {
 	smd.scanLog.Debug()
 
@@ -227,6 +244,14 @@ func (r *jfrog) GetTagList(domain, repo, tag string) ([]string, error) {
 		}
 		repo = subRepo
 	}
+
+	// GetArtifactoryTags fetches tags fetch tags using the Artifactory API (introduced in JFrog 4.4.3)
+	if tags, err := r.GetArtifactoryTags(repo, rc); len(tags) > 0 || err != nil {
+		return tags, err
+	}
+
+	// Fallback to the original `Tags` API if the Artifactory API fails or returns no tags
+	smd.scanLog.WithFields(log.Fields{"repo": repo}).Debug("Falling back to rc.Tags API")
 	return rc.Tags(repo)
 }
 

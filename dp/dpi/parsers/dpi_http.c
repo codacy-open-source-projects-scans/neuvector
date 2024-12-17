@@ -322,7 +322,7 @@ static int http_parse_request(http_ctx_t *ctx, uint8_t *ptr, int len)
     ctx->data->proto = proto;
 
     // TODO: move to signature
-    if (part[1].end - part[1].start > 12 && memcmp(part[1].start, "/wp-content/", 12) == 0) {
+    if (part[1].end - part[1].start > 12 && part[1].start && memcmp(part[1].start, "/wp-content/", 12) == 0) {
         dpi_ep_set_app(ctx->p, 0, DPI_APP_WORDPRESS);
     }
 
@@ -612,6 +612,8 @@ static int http_header_xforwarded_for_token(void *param, uint8_t *ptr, int len, 
     if (s->xff_client_ip == (uint32_t)(-1)) {
         DEBUG_LOG(DBG_PARSER, p, "ipv6 or wrong format ipv4: %s, ip=0x%08x\n",ip_str, s->xff_client_ip);
         s->xff_client_ip = 0;
+        //memory freed
+        free(ip_str);
         return CONSUME_TOKEN_SKIP_LINE;
     }
     s->flags |= DPI_SESS_FLAG_XFF;
@@ -1166,12 +1168,12 @@ static void http_delete_data(void *data)
 }
 
 static dpi_parser_t dpi_parser_http = {
-    new_session: http_new_session,
-    delete_data: http_delete_data,
-    parser:      http_parser,
-    name:        "http",
-    ip_proto:    IPPROTO_TCP,
-    type:        DPI_PARSER_HTTP,
+    .new_session = http_new_session,
+    .delete_data = http_delete_data,
+    .parser = http_parser,
+    .name = "http",
+    .ip_proto = IPPROTO_TCP,
+    .type = DPI_PARSER_HTTP,
 };
 
 dpi_parser_t *dpi_http_tcp_parser(void)

@@ -101,8 +101,8 @@ enum {
 typedef struct proc_info_ {
     char name[32];
     char path[64];
-    int active  : 1,
-        running : 1;
+    int active;
+    int running;
     pid_t pid;
     struct timeval start;
     int exit_count;
@@ -121,12 +121,12 @@ typedef struct proc_info_ {
 #define RC_CONFIG_OVS 2
 
 static proc_info_t g_procs[PROC_MAX] = {
-[PROC_CTRL]                {"ctrl", "/usr/local/bin/controller", },
-[PROC_SCANNER]             {"scanner", "/usr/local/bin/scanner", },
-[PROC_DP]                  {"dp", "/usr/local/bin/dp", },
-[PROC_AGENT]               {"agent", "/usr/local/bin/agent", },
-[PROC_SCANNER_STANDALONE]  {"scanner", "/usr/local/bin/scanner", },
-[PROC_CTRL_OPA]            {"opa", "/usr/local/bin/opa", },
+[PROC_CTRL] = {"ctrl", "/usr/local/bin/controller", },
+[PROC_SCANNER] = {"scanner", "/usr/local/bin/scanner", },
+[PROC_DP] = {"dp", "/usr/local/bin/dp", },
+[PROC_AGENT] = {"agent", "/usr/local/bin/agent", },
+[PROC_SCANNER_STANDALONE] = {"scanner", "/usr/local/bin/scanner", },
+[PROC_CTRL_OPA] = {"opa", "/usr/local/bin/opa", },
 };
 
 static uint32_t g_dp_last_hb[MAX_DP_THREADS], g_dp_miss_hb[MAX_DP_THREADS];
@@ -228,8 +228,8 @@ static pid_t fork_exec(int i)
     pid_t pid;
     char *args[PROC_ARGS_MAX], *join, *adv, *bind, *url, *iface, *subnets, *cnet_type;
     char *lan_port, *rpc_port, *grpc_port, *fed_port, *server_port, *join_port, *adv_port, *adm_port;
-    char *license, *registry, *repository, *tag, *user, *pass, *base, *api_user, *api_pass, *enable;
-    char *on_demand, *pwd_valid_unit, *rancher_ep, *debug_level, *policy_pull_period, *search_regs;
+    char *registry, *repository, *tag, *user, *pass, *base, *api_user, *api_pass, *enable;
+    char *pwd_valid_unit, *rancher_ep, *debug_level, *policy_pull_period, *search_regs;
     char *telemetry_neuvector_ep, *telemetry_current_ver, *telemetry_freq, *csp_env, *csp_pause_interval;
     char *custom_check_control, *log_level;
     int a;
@@ -298,7 +298,7 @@ static pid_t fork_exec(int i)
             args[a ++] = "--adv_port";
             args[a ++] = adv_port;
         }
-        if (((license = getenv(ENV_SCANNER_LICENSE)) != NULL) || (on_demand = getenv(ENV_SCANNER_ON_DEMAND)) != NULL) {
+        if ((getenv(ENV_SCANNER_LICENSE) != NULL) || (getenv(ENV_SCANNER_ON_DEMAND) != NULL)) {
             args[a ++] = "--license";
             args[a++] = "on_demand";
 
@@ -895,7 +895,6 @@ int main (int argc, char **argv)
         g_dp_last_hb[i] = g_dp_miss_hb[i] = g_shm->dp_hb[i] = 0;
     }
 
-    ret = 0;
     switch (g_mode) {
     case MODE_CTRL:
         g_procs[PROC_CTRL].active = true;
@@ -908,7 +907,10 @@ int main (int argc, char **argv)
         break;
     case MODE_AGENT:
         ret = system(SCRIPT_SYSCTL);
-
+        if (ret != 0) {
+            debug("WARNING: sysctl failed to load /etc/sysctl.conf (including net.core.somaxconn and net.unix.max_dgram_qlen)."
+                  "It might have a performance implication on the system. rc = %d.\n", ret);
+        }
         g_procs[PROC_DP].active = true;
         g_procs[PROC_AGENT].active = true;
 
@@ -921,6 +923,10 @@ int main (int argc, char **argv)
         break;
     case MODE_CTRL_AGENT:
         ret = system(SCRIPT_SYSCTL);
+        if (ret != 0) {
+            debug("WARNING: sysctl failed to load /etc/sysctl.conf (including net.core.somaxconn and net.unix.max_dgram_qlen)."
+                  "It might have a performance implication on the system. rc = %d.\n", ret);
+        }
 
         g_procs[PROC_CTRL].active = true;
         // disable scanner in controller

@@ -1711,6 +1711,90 @@ type RESTSystemStatsData struct {
 	Stats *RESTSystemStats `json:"stats"`
 }
 
+type RESTRiskScoreMetricsWL struct {
+	RunningPods    int `json:"running_pods"`
+	PrivilegedWLs  int `json:"privileged_wls"`
+	RootWLs        int `json:"root_wls"`
+	DiscoverExtEPs int `json:"discover_ext_eps"`
+	MonitorExtEPs  int `json:"monitor_ext_eps"`
+	ProtectExtEPs  int `json:"protect_ext_eps"`
+	ThrtExtEPs     int `json:"threat_ext_eps"`
+	VioExtEPs      int `json:"violate_ext_eps"`
+}
+
+type RESTRiskScoreMetricsGroup struct {
+	Groups                int `json:"groups"`
+	DiscoverGroups        int `json:"discover_groups"`
+	MonitorGroups         int `json:"monitor_groups"`
+	ProtectGroups         int `json:"protect_groups"`
+	ProfileDiscoverGroups int `json:"profile_discover_groups"`
+	ProfileMonitorGroups  int `json:"profile_monitor_groups"`
+	ProfileProtectGroups  int `json:"profile_protect_groups"`
+	DiscoverGroupsZD      int `json:"discover_groups_zero_drift"`
+	MonitorGroupsZD       int `json:"monitor_groups_zero_drift"`
+	ProtectGroupsZD       int `json:"protect_groups_zero_drift"`
+}
+
+type RESTRiskScoreMetricsCVE struct {
+	DiscoverCVEs int `json:"discover_cves"`
+	MonitorCVEs  int `json:"monitor_cves"`
+	ProtectCVEs  int `json:"protect_cves"`
+	PlatformCVEs int `json:"platform_cves"`
+	HostCVEs     int `json:"host_cves"`
+}
+
+type RESTRiskScoreMetrics struct {
+	Platform         string                    `json:"platform"`
+	K8sVersion       string                    `json:"kube_version"`
+	OCVersion        string                    `json:"openshift_version"`
+	NewServiceMode   string                    `json:"new_service_policy_mode"`
+	NewProfileMode   string                    `json:"new_service_profile_mode"`
+	DenyAdmCtrlRules int                       `json:"deny_adm_ctrl_rules"`
+	Hosts            int                       `json:"hosts"`
+	WLs              RESTRiskScoreMetricsWL    `json:"workloads"`
+	Groups           RESTRiskScoreMetricsGroup `json:"groups"`
+	CVEs             RESTRiskScoreMetricsCVE   `json:"cves"`
+}
+
+type RESTExposedEndpoint struct {
+	ID             string                         `json:"id"`
+	Name           string                         `json:"name"`
+	DisplayName    string                         `json:"display_name"`
+	PodName        string                         `json:"pod_name"`
+	Service        string                         `json:"service"`
+	ThreatSeverity string                         `json:"severity"`
+	CriticalVuls   int                            `json:"critical"`
+	HighVuls       int                            `json:"high"`
+	MedVuls        int                            `json:"medium"`
+	PolicyMode     string                         `json:"policy_mode"`
+	PolicyAction   string                         `json:"policy_action"`
+	Protos         []string                       `json:"protocols,omitempty"`
+	Apps           []string                       `json:"applications,omitempty"`
+	Ports          []string                       `json:"ports,omitempty"`
+	Entries        []*RESTConversationReportEntry `json:"entries"`
+}
+
+type RESTSecurityScores struct {
+	NewServiceModeScore      int `json:"new_service_mode_score"`
+	ServiceModeScore         int `json:"service_mode_score"`
+	ServiceModeScoreBy100    int `json:"service_mode_score_by_100"`
+	ExposureScore            int `json:"exposure_score"`
+	ExposureScoreBy100       int `json:"exposure_score_by_100"`
+	PrivilegedContainerScore int `json:"privileged_container_score"`
+	RunAsRootScore           int `json:"run_as_root_score"`
+	AdmissionRuleScore       int `json:"admission_rule_score"`
+	VulnerabilityScore       int `json:"vulnerability_score"`
+	VulnerabilityScoreBy100  int `json:"vulnerability_score_by_100"`
+	SecurityRiskScore        int `json:"security_risk_score"`
+}
+
+type RESTScoreMetricsData struct {
+	Metrics        *RESTRiskScoreMetrics  `json:"metrics"`
+	Ingress        []*RESTExposedEndpoint `json:"ingress"`
+	Egress         []*RESTExposedEndpoint `json:"egress"`
+	SecurityScores *RESTSecurityScores    `json:"security_scores"`
+}
+
 type RESTProxy struct {
 	URL      string `json:"url"`
 	Username string `json:"username"`
@@ -2358,6 +2442,7 @@ type RESTVulnerabilityAssetV2 struct {
 	VectorsV3   string                              `json:"vectors_v3"`
 	PublishedTS int64                               `json:"published_timestamp"`
 	LastModTS   int64                               `json:"last_modified_timestamp"`
+	FeedRating  string                              `json:"feed_rating"`
 
 	Workloads   []*RESTWorkloadAsset `json:"workloads,omitempty"`
 	WorkloadIDs []string             `json:"-"`
@@ -2952,6 +3037,7 @@ type RESTProcessProfileConfigData struct {
 
 const MinDlpRuleID = 20000
 const MinDlpPredefinedRuleID = 30000
+const MinDlpFedPredefinedRuleID = 35000
 const MaxDlpPredefinedRuleID = 40000
 
 type RESTDlpCriteriaEntry struct {
@@ -2994,7 +3080,7 @@ type RESTDlpGroup struct {
 	Name    string            `json:"name"`
 	Status  bool              `json:"status"`
 	Sensors []*RESTDlpSetting `json:"sensors"`
-	CfgType string            `json:"cfg_type"` // CfgTypeUserCreated / CfgTypeGround
+	CfgType string            `json:"cfg_type"` // CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal
 }
 
 type RESTDlpGroupData struct {
@@ -3029,7 +3115,7 @@ type RESTDlpSensor struct {
 	RuleList  []*RESTDlpRule `json:"rules"`
 	Comment   string         `json:"comment"`
 	Predefine bool           `json:"predefine"`
-	CfgType   string         `json:"cfg_type"` // CfgTypeUserCreated / CfgTypeGround
+	CfgType   string         `json:"cfg_type"` // CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal
 }
 
 type RESTDlpSensorData struct {
@@ -3046,6 +3132,7 @@ type RESTDlpSensorConfig struct {
 	RuleDelList *[]RESTDlpRule `json:"delete,omitempty"` //delete list used by CLI
 	Rules       *[]RESTDlpRule `json:"rules,omitempty"`  //replace list used by GUI
 	Comment     *string        `json:"comment,omitempty"`
+	CfgType     string         `json:"cfg_type"` //CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal
 }
 
 type RESTDlpSensorConfigData struct {
@@ -3157,6 +3244,7 @@ type RESTWafSensorConfig struct {
 	RuleDelList *[]RESTWafRule `json:"delete,omitempty"` //delete list used by CLI
 	Rules       *[]RESTWafRule `json:"rules,omitempty"`  //replace list used by GUI
 	Comment     *string        `json:"comment,omitempty"`
+	CfgType     string         `json:"cfg_type"` //CfgTypeUserCreated / CfgTypeGround / CfgTypeFederal
 }
 
 type RESTWafSensorConfigData struct {

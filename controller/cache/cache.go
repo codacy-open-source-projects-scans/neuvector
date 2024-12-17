@@ -183,6 +183,7 @@ type Context struct {
 	TimerWheel               *utils.TimerWheel
 	DebugCPath               bool
 	Debug                    []string
+	DefaultLogLevel          log.Level
 	EnableRmNsGroups         bool
 	EnableIcmpPolicy         bool
 	ConnLog                  *log.Logger
@@ -265,8 +266,6 @@ func LeadChangeNotify(isLeader bool, leadAddr string) {
 
 	cacher.isLeader = isLeader
 	cacher.leadAddr = leadAddr
-
-	resource.SetLeader(isLeader)
 
 	if leadAddr != "" {
 		cacher.leaderElectedAt = time.Now()
@@ -2348,6 +2347,7 @@ func GetCVERecord(name, dbKey, baseOS string) *db.DbVulAsset {
 		VectorsV3:   cve.VectorsV3,
 		PublishedTS: cve.PublishedTS,
 		LastModTS:   cve.LastModTS,
+		FeedRating:  cve.FeedRating,
 	}
 	return vul
 }

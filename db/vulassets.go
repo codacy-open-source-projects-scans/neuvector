@@ -67,7 +67,7 @@ func GetVulnerabilityQuery(r *http.Request) (*VulQueryFilter, error) {
 	q.Filters.NodeNameMatchType = validateOrDefault(q.Filters.NodeNameMatchType, []string{"equals", "contains"}, "")
 	q.Filters.ContainerNameMatchType = validateOrDefault(q.Filters.ContainerNameMatchType, []string{"equals", "contains"}, "")
 
-	q.Filters.OrderByColumn = validateOrDefault(q.Filters.OrderByColumn, []string{"name", "score", "score_v3", "published_timestamp", "impact"}, "name")
+	q.Filters.OrderByColumn = validateOrDefault(q.Filters.OrderByColumn, []string{"name", "score", "score_v3", "published_timestamp", "impact", "feed_rating"}, "name")
 	q.Filters.OrderByType = validateOrDefault(q.Filters.OrderByType, []string{"asc", "desc"}, "desc")
 
 	if r.Method == http.MethodGet {
@@ -75,7 +75,7 @@ func GetVulnerabilityQuery(r *http.Request) (*VulQueryFilter, error) {
 		q.Filters.OrderByColumn = r.URL.Query().Get("orderbyColumn")
 		q.Filters.OrderByType = r.URL.Query().Get("orderby")
 
-		q.Filters.OrderByColumn = validateOrDefault(q.Filters.OrderByColumn, []string{"name", "score", "score_v3", "published_timestamp", "impact"}, "")
+		q.Filters.OrderByColumn = validateOrDefault(q.Filters.OrderByColumn, []string{"name", "score", "score_v3", "published_timestamp", "impact", "feed_rating"}, "")
 		q.Filters.OrderByType = validateOrDefault(q.Filters.OrderByType, []string{"asc", "desc"}, "")
 
 		q.Filters.LastModifiedTime = getQueryParamInteger64(r, "lastmtime", 0)
@@ -195,7 +195,9 @@ func FilterVulAssetsV2(allowed map[string]utils.Set, queryFilter *VulQueryFilter
 		nTotalCVE++
 
 		// CVE details might be incomplete during Consul restore, do this first
-		fillCVERecordV2(vulasset)
+		if err := fillCVERecordV2(vulasset); err != nil {
+			log.WithFields(log.Fields{"error": err}).Error("fillCVERecordV2")
+		}
 
 		// CVE based filter
 		if !meetCVEBasedFilter(vulasset, queryFilter) {
@@ -395,7 +397,9 @@ func PopulateSessionToFile(sessionToken string, vulAssets []*DbVulAsset) error {
 
 	// delete session table in memory, allow some time for the ongoing read operation to complete before proceeding
 	time.Sleep(30 * time.Second)
-	deleteSessionTempTableInMemDb(sessionToken)
+	if err := deleteSessionTempTableInMemDb(sessionToken); err != nil {
+		log.WithFields(log.Fields{"error": err}).Debug("deleteSessionTempTableInMemDb")
+	}
 
 	return nil
 }
@@ -412,7 +416,7 @@ func PopulateSessionVulAssets(sessionToken string, vulAssets []*DbVulAsset, memo
 func GetVulAssetSessionV2(requesetQuery *VulQueryFilter) (*api.RESTVulnerabilityAssetDataV2, utils.Set, error) {
 	getOrderColumn := func(filters *api.VulQueryFilterViewModel) exp.OrderedExpression {
 		column := "name"
-		if filters.OrderByColumn == "name" || filters.OrderByColumn == "score" || filters.OrderByColumn == "score_v3" || filters.OrderByColumn == "published_timestamp" {
+		if filters.OrderByColumn == "name" || filters.OrderByColumn == "score" || filters.OrderByColumn == "score_v3" || filters.OrderByColumn == "published_timestamp" || filters.OrderByColumn == "feed_rating" {
 			column = filters.OrderByColumn
 		}
 
@@ -436,7 +440,8 @@ func GetVulAssetSessionV2(requesetQuery *VulQueryFilter) (*api.RESTVulnerability
 			}
 
 			scoreExp := goqu.C(scoreColumn).Like(fmt.Sprintf("%%%s%%", queryFilter.Filters.QuickFilter))
-			return goqu.Or(nameExp, scoreExp)
+			feedRatingExp := goqu.C("feed_rating").Like(fmt.Sprintf("%%%s%%", queryFilter.Filters.QuickFilter))
+			return goqu.Or(nameExp, scoreExp, feedRatingExp)
 		}
 
 		return goqu.And(goqu.Ex{})
@@ -451,7 +456,7 @@ func GetVulAssetSessionV2(requesetQuery *VulQueryFilter) (*api.RESTVulnerability
 
 	columns := []interface{}{"name", "severity", "description", "link", "score",
 		"vectors", "score_v3", "vectors_v3", "published_timestamp", "last_modified_timestamp",
-		"workloads", "nodes", "images", "platforms"}
+		"workloads", "nodes", "images", "platforms", "feed_rating"}
 
 	queryStat, err := GetQueryStat(sessionToken)
 	if err != nil {
@@ -524,7 +529,7 @@ func GetVulAssetSessionV2(requesetQuery *VulQueryFilter) (*api.RESTVulnerability
 		var score, scorev3 int
 		err := rows.Scan(&record.Name, &record.Severity, &record.Description, &record.Link, &score,
 			&record.Vectors, &scorev3, &record.VectorsV3, &record.PublishedTS, &record.LastModTS,
-			&workloads, &nodes, &images, &platforms)
+			&workloads, &nodes, &images, &platforms, &record.FeedRating)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -653,7 +658,9 @@ func CeateSessionVulAssetTable(sessionToken string, memoryDb bool) error {
 	if memoryDb {
 		memTables := GetAllTableInMemoryDb()
 		if !strings.Contains(memTables, sessionToken) {
-			reopenMemoryDb()
+			if err := reopenMemoryDb(); err != nil {
+				return err
+			}
 
 			log.WithFields(log.Fields{"sessionToken": sessionToken}).Error("CeateSessionVulAssetTable error, missing session table in memdb. Recreate it.")
 			err := createSessionVulAssetTable(memoryDbHandle, sessionToken)
@@ -827,7 +834,8 @@ func populateSession(db *sql.DB, sessionToken string, vulAssets []*DbVulAsset) e
 	tableName := formatSessionTempTableName(sessionToken)
 
 	columns := []string{"name", "severity", "description", "packages", "link", "score", "vectors", "score_v3", "vectors_v3",
-		"published_timestamp", "last_modified_timestamp", "workloads", "nodes", "images", "platforms", "cve_sources", "f_withFix", "f_profile", "debuglog", "score_str", "scorev3_str", "impact_weight"}
+		"published_timestamp", "last_modified_timestamp", "workloads", "nodes", "images", "platforms", "cve_sources", "f_withFix", "f_profile", "debuglog", "score_str", "scorev3_str", "impact_weight",
+		"feed_rating"}
 
 	varSlice := make([]string, len(columns))
 	for i := range varSlice {
@@ -854,7 +862,8 @@ func populateSession(db *sql.DB, sessionToken string, vulAssets []*DbVulAsset) e
 			vulAsset.Link, vulAsset.Score, vulAsset.Vectors, vulAsset.ScoreV3, vulAsset.VectorsV3, vulAsset.PublishedTS, vulAsset.LastModTS,
 			vulAsset.Workloads, vulAsset.Nodes, vulAsset.Images, vulAsset.Platforms, vulAsset.CVESources,
 			vulAsset.F_withFix, vulAsset.F_profile, debugLog,
-			formatScoreToStr(vulAsset.Score), formatScoreToStr(vulAsset.ScoreV3), vulAsset.ImpactWeight)
+			formatScoreToStr(vulAsset.Score), formatScoreToStr(vulAsset.ScoreV3), vulAsset.ImpactWeight,
+			vulAsset.FeedRating)
 		if err != nil {
 			return err
 		}
@@ -880,13 +889,14 @@ func fillCVERecordV2(record *DbVulAsset) error {
 		record.VectorsV3 = vulAsset.VectorsV3
 		record.PublishedTS = vulAsset.PublishedTS
 		record.LastModTS = vulAsset.LastModTS
+		record.FeedRating = vulAsset.FeedRating
 	}
 
 	return nil
 }
 
 func GetTopAssets(allowed map[string]utils.Set, assetType string, topN int) ([]*api.AssetCVECount, error) {
-	allowedAssets := []string{}
+	var allowedAssets []string
 
 	buildWhereClause := func(assetType string, allowedID []string) exp.ExpressionList {
 		part1_type := goqu.Ex{
@@ -978,6 +988,8 @@ func buildAssetFilterWhereClause(queryFilter *api.VulQueryFilterViewModel) exp.E
 
 func batchProessFillVulPackages(pool *pond.WorkerPool, mu *sync.Mutex, cvePackages map[string]map[string]utils.Set, vulsBytes []byte, idnsStr string, cveList *[]string) {
 	pool.Submit(func() {
-		funcFillVulPackages(mu, cvePackages, vulsBytes, idnsStr, cveList, nil)
+		if err := funcFillVulPackages(mu, cvePackages, vulsBytes, idnsStr, cveList, nil); err != nil {
+			log.WithFields(log.Fields{"error": err}).Error("funcFillVulPackages")
+		}
 	})
 }

@@ -519,6 +519,7 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 	}
 	scanMutexUnlock()
 
+	reportedVuls := report.Vuls
 	if ok && dbAssetVul != nil {
 		dbAssetVul.Vuls = report.Vuls
 		dbAssetVul.Modules = report.Modules
@@ -540,7 +541,7 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 
 	// all controller should call auditUpdate to record the log, the leader will take action
 	if alives != nil {
-		clog := scanReport2ScanLog(id, objType, report, criticals, highs, meds, nil, nil, nil, "")
+		clog := scanReport2ScanLog(id, objType, report, reportedVuls, criticals, highs, meds, nil, nil, nil, "")
 		syncLock(syncCatgAuditIdx)
 		auditUpdate(id, share.EventCVEReport, objType, clog, alives, fixedCriticalsInfo, fixedHighsInfo)
 		syncUnlock(syncCatgAuditIdx)
@@ -619,7 +620,13 @@ func scannerDBChange(newVer string) {
 	go func() {
 		scanMutexLock()
 		for id, info := range scanMap {
-			if info.status == statusScanNone && info.version != newVer {
+			if info.version == newVer { // no need for new scan
+				continue
+			}
+			if info.status == statusScanning || info.status == statusScanNone {
+				if info.status == statusScanning {
+					scanScher.DeleteTask(id, scheduler.PriorityLow)
+				}
 				info.status = statusScanScheduled
 				info.priority = scheduler.PriorityLow
 				info.retry = 0
@@ -977,7 +984,7 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 				// for any scan report on master/standalone cluster & non-fed scan report on managed cluster
 				if fedRole != api.FedRoleJoint || !strings.HasPrefix(name, api.FederalGroupPrefix) {
 					if alives != nil {
-						clog := scanReport2ScanLog(id, share.ScanObjectType_IMAGE, report, criticals, highs, meds, layerCriticals, layerHighs, layerMeds, name)
+						clog := scanReport2ScanLog(id, share.ScanObjectType_IMAGE, report, report.Vuls, criticals, highs, meds, layerCriticals, layerHighs, layerMeds, name)
 						syncLock(syncCatgAuditIdx)
 						auditUpdate(id, share.EventCVEReport, share.ScanObjectType_IMAGE, clog, alives, fixedCriticalsInfo, fixedHighsInfo)
 						syncUnlock(syncCatgAuditIdx)
@@ -1490,7 +1497,6 @@ func getWorkloadDbAssetVul(c *workloadCache, criticals, highs, meds, lows []stri
 		d.W_applications = string(b)
 	}
 
-	d.Policy_mode, _ = getWorkloadPerGroupPolicyMode(c)
 	d.Scanned_at = api.RESTTimeString(lastScanTime.UTC())
 	return d
 }
@@ -1511,7 +1517,6 @@ func getHostDbAssetVul(c *hostCache, criticals, highs, meds, lows []string, last
 		N_containers: c.workloads.Cardinality(),
 	}
 
-	d.Policy_mode, _ = getHostPolicyMode(c)
 	d.Scanned_at = api.RESTTimeString(lastScanTime.UTC())
 	return d
 }

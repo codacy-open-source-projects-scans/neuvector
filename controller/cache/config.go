@@ -76,9 +76,7 @@ func agentConfig(nType cluster.ClusterNotifyType, key string, value []byte) {
 
 func setControllerDebug(debug []string, debugCPath bool) {
 	var hasCPath, hasConn, hasMutex, hasScan, hasCluster, hasK8sMonitor bool
-	if len(debug) == 0 && !debugCPath {
-		return
-	}
+
 	for _, d := range debug {
 		switch d {
 		case "cpath":
@@ -98,7 +96,7 @@ func setControllerDebug(debug []string, debugCPath bool) {
 	if debugCPath || hasCPath {
 		log.SetLevel(log.DebugLevel)
 	} else {
-		log.SetLevel(log.InfoLevel)
+		log.SetLevel(cctx.DefaultLogLevel)
 	}
 	if hasConn {
 		cctx.ConnLog.Level = log.DebugLevel
@@ -108,7 +106,7 @@ func setControllerDebug(debug []string, debugCPath bool) {
 	if hasScan || debugCPath || hasCPath {
 		cctx.ScanLog.Level = log.DebugLevel
 	} else {
-		cctx.ScanLog.Level = log.InfoLevel
+		cctx.ScanLog.Level = cctx.DefaultLogLevel
 	}
 	if hasMutex {
 		cctx.MutexLog.Level = log.DebugLevel
@@ -118,12 +116,12 @@ func setControllerDebug(debug []string, debugCPath bool) {
 	if hasCluster || debugCPath {
 		cluster.SetLogLevel(log.DebugLevel)
 	} else {
-		cluster.SetLogLevel(log.InfoLevel)
+		cluster.SetLogLevel(cctx.DefaultLogLevel)
 	}
 	if hasK8sMonitor {
 		cctx.K8sResLog.Level = log.DebugLevel
 	} else {
-		cctx.K8sResLog.Level = log.InfoLevel
+		cctx.K8sResLog.Level = cctx.DefaultLogLevel
 	}
 
 	if debugCPath || hasCPath || hasConn || hasMutex ||
@@ -678,6 +676,20 @@ func configInit() {
 	}
 	if !utils.CompareSliceWithoutOrder(systemConfigCache.ControllerDebug, cctx.Debug) {
 		systemConfigCache.ControllerDebug = cctx.Debug
+		// Refresh cfg and rev before updating ControllerDebug
+		cfg, rev = clusHelper.GetSystemConfigRev(acc)
+		retry := 0
+		for retry < 3 {
+			cfg.ControllerDebug = cctx.Debug
+			if err := clusHelper.PutSystemConfigRev(cfg, rev); err != nil {
+				if cfg, rev = clusHelper.GetSystemConfigRev(acc); cfg == nil {
+					break
+				}
+				retry++
+			} else {
+				break
+			}
+		}
 	}
 	setControllerDebug(systemConfigCache.ControllerDebug, cctx.DebugCPath)
 	scan.UpdateProxy(&systemConfigCache.RegistryHttpProxy, &systemConfigCache.RegistryHttpsProxy)
