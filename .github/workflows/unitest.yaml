@@ -1,0 +1,31 @@
+name: Run unitest on push and pull request
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  unitest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: |
+        sudo apt update && sudo apt install -y libpcre3-dev
+    - run: |
+        ./unitest.sh
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: 18
+    - name: openapi-lint 
+      run: |
+        npm i -g @redocly/cli@1.25.11
+        redocly lint controller/api/apis.yaml --skip-rule operation-operationId --skip-rule operation-4xx-response --skip-rule no-ambiguous-paths --skip-rule security-defined
+        redocly lint controller/api/internal_apis.yaml --skip-rule operation-operationId
