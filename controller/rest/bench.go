@@ -742,6 +742,9 @@ func getCISStatusFromCluster(bench share.BenchType, id string) (int, string) {
 
 func getCISReportFromCluster(bench share.BenchType, id string, cpf *complianceProfileFilter, acc *access.AccessControl) (*api.RESTBenchReport, int, string) {
 	rpt, code, errMsg := _getCISReportFromCluster(bench, id, true, cpf)
+	if code == api.RESTErrFailReadCluster {
+		go triggerBenchRescan(bench, id, acc)
+	}
 	if code == 0 {
 		rpt.Items = filterComplianceChecks(rpt.Items, cpf)
 	}
@@ -752,10 +755,11 @@ func getKubeCISReportFromCluster(id string, cpf *complianceProfileFilter, acc *a
 	rpt1, code, _ := getCISReportFromCluster(share.BenchKubeMaster, id, cpf, acc)
 	if code != 0 {
 		// Ignore the error in the master node as some nodes are not master. (BenchStatusNotSupport)
-		log.WithFields(log.Fields{"code": code}).Debug("Ignore the error in the master node as some nodes are not master")
+		log.WithFields(log.Fields{"code": code}).Info("Ignore the error in the master node as some nodes are not master")
 	}
 	rpt2, code, errMsg := getCISReportFromCluster(share.BenchKubeWorker, id, cpf, acc)
 	if code != 0 {
+		log.WithFields(log.Fields{"code": code}).Debug("Ignore the error in the worker node as some nodes are not worker")
 		return nil, code, errMsg
 	}
 
@@ -765,6 +769,46 @@ func getKubeCISReportFromCluster(id string, cpf *complianceProfileFilter, acc *a
 		rpt1.Items = append(rpt1.Items, rpt2.Items...)
 
 		return rpt1, 0, ""
+	}
+}
+
+func triggerBenchRescan(bench share.BenchType, id string, acc *access.AccessControl) {
+	var invokeBench func(string) error
+	var err error
+
+	switch bench {
+	case share.BenchKubeMaster, share.BenchKubeWorker:
+		invokeBench = rpc.RunKubernetesBench
+	case share.BenchDockerHost, share.BenchContainer, share.BenchContainerSecret, share.BenchContainerSetID:
+		invokeBench = rpc.RunDockerBench
+	case share.BenchCustomHost:
+		invokeBench = rpc.RunCustomHostBench
+	case share.BenchCustomContainer:
+		invokeBench = rpc.RunCustomContainerBench
+	default:
+		log.WithFields(log.Fields{
+			"id":    id,
+			"bench": bench,
+		}).Debug("Benchmark type does not support manual trigger")
+		return
+	}
+
+	agents, err := cacher.GetAgentsbyHost(id, acc)
+	if err != nil {
+		log.WithFields(log.Fields{"host": id, "error": err}).Error("Cannot get agents to rescan")
+		return
+	} else if len(agents) == 0 {
+		log.WithFields(log.Fields{"host": id}).Debug("No agents found to rescan")
+		return
+	}
+
+	if err := invokeBench(agents[0]); err != nil {
+		log.WithFields(log.Fields{
+			"id":      id,
+			"bench":   bench,
+			"agentID": agents[0],
+			"error":   err,
+		}).Error("Failed to trigger benchmark scan")
 	}
 }
 
