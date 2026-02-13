@@ -329,10 +329,10 @@ func (w *FileWatch) sendMsg(cid string, path string, event uint32, pInfo []*Proc
 }
 
 func (w *FileWatch) loop() {
-	//nolint:staticcheck // SA1015
+
 	msgTicker := time.Tick(time.Second * 4)
 	// every 10s send learning rules to controller
-	//nolint:staticcheck // SA1015
+
 	learnTicker := time.Tick(time.Second * 10)
 
 	for {
@@ -584,7 +584,7 @@ func (w *FileWatch) addDir(bIncInotify bool, finfo *osutil.FileInfoExt, files ma
 }
 
 func getBaseDirPrefix(filter share.CLUSFileMonitorFilter) string {
-	dir := strings.Replace(filter.Path, "\\.", ".", -1)
+	dir := strings.ReplaceAll(filter.Path, "\\.", ".")
 	if index := strings.Index(dir, ".*"); index > 0 {
 		dir = dir[:(index - 1)]
 	}
@@ -1025,7 +1025,7 @@ func (w *FileWatch) getDirFileList(pid int, res *workerlet.WalkPathResult, filte
 	dirList := make(map[string]*osutil.FileInfoExt)
 	singleFiles := make([]*osutil.FileInfoExt, 0)
 
-	base := strings.Replace(filter.Path, "\\.", ".", -1)
+	base := strings.ReplaceAll(filter.Path, "\\.", ".")
 	baseD := base + "/"
 	flt := &filterRegex{path: filterIndexKey(filter), recursive: filter.Recursive}
 	flt.regex, _ = regexp.Compile(fmt.Sprintf("^%s$", flt.path))
