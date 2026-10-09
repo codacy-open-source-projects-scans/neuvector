@@ -11,6 +11,8 @@ import (
 	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/controller/common"
 	"github.com/neuvector/neuvector/controller/kv"
+	"github.com/neuvector/neuvector/share"
+	"github.com/neuvector/neuvector/share/utils"
 )
 
 func TestUserCreateDelete(t *testing.T) {
@@ -92,8 +94,8 @@ func TestUserConfig(t *testing.T) {
 	clusHelper = &mockCluster
 	cacher = &mockCache{}
 
-	user1 := makeLocalUser("user1", "111111", api.UserRoleAdmin)
-	user2 := makeLocalUser("user2", "222222", api.UserRoleReader)
+	user1 := makeLocalUser(t, "user1", "111111", api.UserRoleAdmin)
+	user2 := makeLocalUser(t, "user2", "222222", api.UserRoleReader)
 	if err := clusHelper.CreateUser(user1); err != nil {
 		t.Errorf("CreateUser error=%v", err)
 	}
@@ -148,8 +150,8 @@ func TestUserConfigKick(t *testing.T) {
 
 	cacher = &mockCache{}
 
-	user1 := makeLocalUser("user1", "111111", api.UserRoleAdmin)
-	user2 := makeLocalUser("user2", "222222", api.UserRoleReader)
+	user1 := makeLocalUser(t, "user1", "111111", api.UserRoleAdmin)
+	user2 := makeLocalUser(t, "user2", "222222", api.UserRoleReader)
 	if err := clusHelper.CreateUser(user1); err != nil {
 		t.Errorf("CreateUser error=%v", err)
 	}
@@ -299,8 +301,8 @@ func TestUserConfigNegative(t *testing.T) {
 	mockCluster.Init(nil, nil)
 	clusHelper = &mockCluster
 
-	user1 := makeLocalUser("user1", "111111", api.UserRoleAdmin)
-	user2 := makeLocalUser("user2", "222222", api.UserRoleReader)
+	user1 := makeLocalUser(t, "user1", "111111", api.UserRoleAdmin)
+	user2 := makeLocalUser(t, "user2", "222222", api.UserRoleReader)
 	if err := clusHelper.CreateUser(user1); err != nil {
 		t.Errorf("CreateUser error=%v", err)
 	}
@@ -483,7 +485,7 @@ func TestUserRoleSelf(t *testing.T) {
 	clusHelper = &mockCluster
 
 	// -- make user as global reader & ns1, ns2 admin
-	user1 := makeLocalUserWithRole("user1", "111111", api.UserRoleReader,
+	user1 := makeLocalUserWithRole(t, "user1", "111111", api.UserRoleReader,
 		map[string][]string{api.UserRoleAdmin: {"ns1", "ns2"}},
 	)
 	if err := clusHelper.CreateUser(user1); err != nil {
@@ -664,6 +666,34 @@ func TestApikeyCreateDelete(t *testing.T) {
 	unmarshalJSON(t, w.body, &resp)
 	if len(resp.Apikeys) != 0 {
 		t.Errorf("Incorrect apikey count in rest: count=%v expect=0", len(resp.Apikeys))
+	}
+
+	postTest()
+}
+
+func TestCheckRolesNotForDomain(t *testing.T) {
+	preTest()
+
+	// Create role with permission
+	access.AddRole("custom-role-1", &share.CLUSUserRoleInternal{
+		Name:         "custom-role-1",
+		WritePermits: share.PERM_AUTHENTICATION | share.PERM_CICD_SCAN | share.PERM_ADM_CONTROL,
+	})
+	access.AddRole("custom-role-2", &share.CLUSUserRoleInternal{
+		Name:         "custom-role-2",
+		WritePermits: share.PERM_REG_SCAN | share.PERM_ADM_CONTROL,
+	})
+
+	expected := []string{api.UserRoleCIOps, "custom-role-1"}
+	domainRoles := access.GetValidRoles(access.CONST_VISIBLE_DOMAIN_ROLE)
+	rolesNotForDomain := filterRolesInvalidForDomain(domainRoles)
+	if len(rolesNotForDomain) != 2 {
+		t.Fatalf("Failed to check get the roles not for domain: expect=%v, got=%v.", expected, rolesNotForDomain)
+	}
+
+	expectedRoles := utils.NewSetFromStringSlice(rolesNotForDomain)
+	if !expectedRoles.Contains(api.UserRoleCIOps) || !expectedRoles.Contains("custom-role-1") {
+		t.Fatalf("Failed to check get the roles not for domain: expect=%v, got=%v.", expected, rolesNotForDomain)
 	}
 
 	postTest()

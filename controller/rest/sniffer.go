@@ -2,6 +2,7 @@ package rest
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -164,7 +165,7 @@ func handlerSnifferShow(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 			restRespError(w, http.StatusNotFound, api.RESTErrObjectNotFound)
 		}
 	} else {
-		if err == common.ErrObjectNotFound || err == common.ErrObjectAccessDenied {
+		if errors.Is(err, common.ErrObjectNotFound) || errors.Is(err, common.ErrObjectAccessDenied) {
 			restRespNotFoundLogAccessDenied(w, login, err)
 		} else {
 			restRespErrorMessage(w, http.StatusInternalServerError, api.RESTErrFailWriteCluster, "Error in rpc")
@@ -184,10 +185,13 @@ func handlerSnifferStart(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		return
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
 
 	var proc api.RESTSnifferArgsData
-	err := json.Unmarshal(body, &proc)
+	err = json.Unmarshal(body, &proc)
 	if err != nil || proc.Sniffer == nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
 		restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)

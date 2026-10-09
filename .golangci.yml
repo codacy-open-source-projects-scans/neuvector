@@ -8,6 +8,32 @@ linters:
     - staticcheck
     - unused
     - nolintlint # reports ill-formed or insufficient nolint directives
+    - bodyclose
+    - forbidigo
+  settings:
+    errcheck:
+      check-blank: true
+    forbidigo:
+      # Match actual fmt.Print*/print/println calls; avoid false positives on locals named print.
+      analyze-types: true
+      forbid:
+        - pattern: ^(fmt\.Print(|f|ln)|print|println)$
+          msg: use logrus instead of fmt.Print* / print / println
+    govet:
+      # Enable all analyzers.
+      # Default: false
+      enable-all: true
+      # Disable analyzers by name.
+      # Run `GL_DEBUG=govet golangci-lint run --enable=govet` to see default, all available analyzers, and enabled analyzers.
+      # Default: []
+      disable:
+        - fieldalignment # too strict
+      # Settings per analyzer.
+      settings:
+        shadow:
+          # Whether to be strict about shadowing; can be noisy.
+          # Default: false
+          strict: false
   exclusions:
     generated: lax
     presets:
@@ -17,13 +43,16 @@ linters:
       - std-error-handling
     rules:
       - linters:
+          - govet
+        text: 'shadow:' # noisy
+      - linters:
           - staticcheck
         path: share/
-        text: 'SA5008: unknown JSON option ("cloak"|"overflow")'
+        text: 'SA5008: invalid appearance of unknown `cloak` tag option'
       - linters:
           - staticcheck
         path: controller/
-        text: 'SA5008: unknown JSON option ("cloak"|"overflow")'
+        text: 'SA5008: invalid appearance of unknown `cloak` tag option'
       - path: (.+)\.go$
         text: 'SA1019: grpc.RPCCompressor is deprecated: use encoding.RegisterCompressor'
       - path: (.+)\.go$
@@ -42,6 +71,10 @@ linters:
         text: 'ST1005: error strings should not be capitalized'
       - path: (.+)\.go$
         text: 'ST1005: error strings should not end with punctuation or newlines'
+      - path: '_test\.go'
+        linters:
+          - errcheck
+          - forbidigo
     paths:
       - third_party$
       - builtin$

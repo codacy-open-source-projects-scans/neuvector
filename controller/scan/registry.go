@@ -371,7 +371,11 @@ func RegistryConfigHandler(nType cluster.ClusterNotifyType, key string, value []
 		}
 
 	case cluster.ClusterNotifyDelete:
-		if config, _, _ := clusHelper.GetRegistry(name, access.NewFedAdminAccessControl()); config != nil {
+		config, _, err := clusHelper.GetRegistry(name, access.NewFedAdminAccessControl())
+		if err != nil {
+			smd.scanLog.WithFields(log.Fields{"registry": name, "error": err}).Warn("Failed to get registry config on delete notification")
+		}
+		if config != nil {
 			// after kv data is unexpectedly wiped out, Restore() could be triggered very fast that RegistryConfigHandler(type=delete) is called after Restore() is done.
 			// in this case, do not really delete the restored registry & its scan data
 			smd.scanLog.WithFields(log.Fields{"registry": name}).Info("skip delete because it Still exists in kv")
@@ -479,7 +483,7 @@ func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSumma
 
 			// Filter the vulnerabilities
 			c.filteredTime = time.Now()
-			localVulTraits := scanUtils.ExtractVulnerability(report.Vuls)
+			localVulTraits := scanUtils.ExtractVulnerability(db.GlobalCVECache(), report.Vuls)
 			if vpf != nil {
 				alives = vpf.FilterVulTraits(localVulTraits, images2IDNames(rs, sum))
 			} else {
@@ -564,6 +568,8 @@ func RegistryImageStateUpdate(name, id string, sum *share.CLUSRegistryImageSumma
 			dbAssetVul := getImageDbAssetVul(c, sum, lows)
 			dbAssetVul.Vuls = report.Vuls
 			dbAssetVul.Modules = report.Modules
+			dbAssetVul.CVEDB_version = report.Version
+			dbAssetVul.CVEDB_createtime = report.CVEDBCreateTime
 
 			b, err := json.Marshal(images2IDNames(rs, sum))
 			if err == nil {
@@ -1191,7 +1197,10 @@ func (rs *Registry) imageScanAdd(img *share.CLUSImage) {
 
 	var imageTagFilter *share.CLUSImage
 	for _, filter := range rs.config.ParsedFilters {
-		filteredRepos, _ := filterRepos(repos, filter, rs.config.CreaterDomains, 0)
+		filteredRepos, err := filterRepos(repos, filter, rs.config.CreaterDomains, 0)
+		if err != nil {
+			smd.scanLog.WithFields(log.Fields{"filter": filter, "error": err}).Warn("Failed to filter repos")
+		}
 		if len(filteredRepos) > 0 {
 			filteredRepos[0].Tag = filter.Tag
 			imageTagFilter = filteredRepos[0]
@@ -1204,7 +1213,10 @@ func (rs *Registry) imageScanAdd(img *share.CLUSImage) {
 		return
 	}
 
-	filteredTags, _ := filterTags(tags, imageTagFilter.Tag, 0)
+	filteredTags, err := filterTags(tags, imageTagFilter.Tag, 0)
+	if err != nil {
+		smd.scanLog.WithFields(log.Fields{"tag": imageTagFilter.Tag, "error": err}).Warn("Failed to filter tags")
+	}
 
 	if err := rs.backupDrv.Login(rs.config); err != nil {
 		smd.scanLog.WithFields(log.Fields{"registry": rs.config.Name, "error": err}).Error()

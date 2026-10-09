@@ -419,8 +419,11 @@ func (m CacheMethod) ScanPlatform(acc *access.AccessControl) error {
 
 // With scan mutex locked
 func refreshScanCache(id string, info *scanInfo, vpf scanUtils.VPFInterface) {
-	reportVuls, _ := db.GetVulnerability(id)
-	localVulTraits := scanUtils.ExtractVulnerability(reportVuls)
+	reportVuls, err := db.GetVulnerability(id)
+	if err != nil {
+		log.WithError(err).Warn("failed to get vulnerability data for scan cache refresh")
+	}
+	localVulTraits := scanUtils.ExtractVulnerability(db.GlobalCVECache(), reportVuls)
 
 	vpf.FilterVulTraits(localVulTraits, info.idns)
 	criticals, highs, meds := scanUtils.CountVulTrait(localVulTraits)
@@ -525,7 +528,7 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 
 		// Filter and count vulnerabilities
 		vpf := cacher.GetVulnerabilityProfileInterface(share.DefaultVulnerabilityProfileName)
-		localVulTraits := scanUtils.ExtractVulnerability(report.Vuls)
+		localVulTraits := scanUtils.ExtractVulnerability(db.GlobalCVECache(), report.Vuls)
 		alives = vpf.FilterVulTraits(localVulTraits, info.idns)
 		criticals, highs, meds, lows, fixedCriticalsInfo, fixedHighsInfo = scanUtils.GatherVulTrait(localVulTraits)
 		brief := fillScanBrief(info, len(criticals), len(highs), len(meds))
@@ -555,6 +558,10 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 	if ok && dbAssetVul != nil {
 		dbAssetVul.Vuls = report.Vuls
 		dbAssetVul.Modules = report.Modules
+		if info.brief != nil {
+			dbAssetVul.CVEDB_version = info.brief.CVEDBVersion
+			dbAssetVul.CVEDB_createtime = info.brief.CVEDBCreateTime
+		}
 
 		if len(info.idns) > 0 {
 			b, err := json.Marshal(info.idns)
@@ -583,9 +590,7 @@ func scanDone(id string, objType share.ScanObjectType, report *share.CLUSScanRep
 func (m CacheMethod) GetScannerCount(acc *access.AccessControl) (int, string, string) {
 	cacheMutexRLock()
 	defer cacheMutexRUnlock()
-	sdb := scanUtils.GetScannerDB()
-	dbTime := sdb.CVEDBCreateTime
-	dbVers := sdb.CVEDBVersion
+	dbVers, dbTime := scanUtils.GetCVEDBMeta()
 	if acc.HasGlobalPermissions(share.PERMS_CLUSTER_READ, 0) {
 		return len(scannerCacheMap), dbTime, dbVers
 	} else {
@@ -769,8 +774,12 @@ func scanMapDelete(taskId string) {
 			key = share.CLUSScanDataPlatformKey(taskId)
 			skey = share.CLUSScanStatePlatformKey(taskId)
 		}
-		_ = cluster.DeleteTree(key)
-		_ = cluster.Delete(skey)
+		if err := cluster.DeleteTree(key); err != nil {
+			log.WithError(err).Warn("failed to delete scan data from cluster")
+		}
+		if err := cluster.Delete(skey); err != nil {
+			log.WithError(err).Warn("failed to delete scan state from cluster")
+		}
 	}
 }
 
@@ -1000,8 +1009,13 @@ func updateScanState(id string, nType share.ScanObjectType, status string) {
 	if status == api.ScanStatusFinished {
 		state.ScannedAt = time.Now().UTC()
 	}
-	value, _ := json.Marshal(state)
-	_ = cluster.Put(skey, value)
+	value, err := json.Marshal(state)
+	if err != nil {
+		log.WithError(err).Warn("failed to marshal scan state")
+	}
+	if err := cluster.Put(skey, value); err != nil {
+		log.WithError(err).Warn("failed to put scan state to cluster")
+	}
 }
 
 func scanStateHandler(nType cluster.ClusterNotifyType, key string, value []byte) {
@@ -1082,7 +1096,10 @@ func registryStateHandler(nType cluster.ClusterNotifyType, key string, value []b
 	switch nType {
 	case cluster.ClusterNotifyAdd, cluster.ClusterNotifyModify:
 		var state share.CLUSRegistryState
-		_ = json.Unmarshal(value, &state)
+		if err := json.Unmarshal(value, &state); err != nil {
+			log.WithError(err).Warn("failed to unmarshal registry state")
+			return
+		}
 		scan.RegistryStateUpdate(name, &state)
 	case cluster.ClusterNotifyDelete:
 		// State is deleted when registry deleted. No handling here.
@@ -1110,7 +1127,10 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 	switch nType {
 	case cluster.ClusterNotifyAdd, cluster.ClusterNotifyModify:
 		var sum share.CLUSRegistryImageSummary
-		_ = json.Unmarshal(value, &sum)
+		if err := json.Unmarshal(value, &sum); err != nil {
+			log.WithError(err).Warn("failed to unmarshal registry image summary")
+			return
+		}
 
 		if fedRole == api.FedRoleJoint && strings.HasPrefix(name, api.FederalGroupPrefix) && (name != common.RegistryFedRepoScanName) {
 			// when a new fed registry with its image scan result are deployed to a worker cluster, it's possible that
@@ -1119,8 +1139,12 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 			if exist := scan.CheckRegistry(name); !exist {
 				if config, _, err := clusHelper.GetRegistry(name, access.NewFedAdminAccessControl()); config != nil {
 					var enc common.EncryptMarshaller
-					value, _ := enc.Marshal(config)
-					scan.RegistryConfigHandler(cluster.ClusterNotifyAdd, share.CLUSRegistryConfigKey(name), value)
+					value, err := enc.Marshal(config)
+					if err != nil {
+						log.WithError(err).Warn("failed to marshal registry config for scan handler")
+					} else {
+						scan.RegistryConfigHandler(cluster.ClusterNotifyAdd, share.CLUSRegistryConfigKey(name), value)
+					}
 				} else {
 					cctx.ScanLog.WithFields(log.Fields{"error": err, "name": name}).Error()
 				}
@@ -1160,14 +1184,17 @@ func registryImageStateHandler(nType cluster.ClusterNotifyType, key string, valu
 					if !ok || currImagesHash == nil {
 						currImagesHash = make(map[string]string, 1)
 					}
-					if report != nil && report.SignatureInfo != nil {
+					if report.SignatureInfo != nil {
 						if report.SignatureInfo.Verifiers != nil {
 							sort.Strings(report.SignatureInfo.Verifiers)
 						}
 						report.SignatureInfo.VerificationTimestamp = ""
 						report.SignatureInfo.VerificationError = 0
 					}
-					res, _ := json.Marshal(&scanResult)
+					res, err := json.Marshal(&scanResult)
+					if err != nil {
+						log.WithError(err).Warn("failed to marshal scan result for hash")
+					}
 					sha256Sum := sha256.Sum256(res)
 					currImagesHash[id] = hex.EncodeToString(sha256Sum[:])
 					fedScanResultHash[fedRegName] = currImagesHash
@@ -1203,7 +1230,9 @@ func fedScanRevsHandler(nType cluster.ClusterNotifyType, key string, value []byt
 	switch nType {
 	case cluster.ClusterNotifyAdd, cluster.ClusterNotifyModify:
 		var scanDataRevs share.CLUSFedScanRevisions
-		_ = json.Unmarshal(value, &scanDataRevs)
+		if err := json.Unmarshal(value, &scanDataRevs); err != nil {
+			log.WithError(err).Warn("failed to unmarshal fed scan data revisions")
+		}
 		fedScanDataRevsCache = scanDataRevs
 
 	case cluster.ClusterNotifyDelete:
@@ -1222,28 +1251,43 @@ func ScannerUpdateHandler(nType cluster.ClusterNotifyType, key string, value []b
 			log.WithFields(log.Fields{"scanner": s}).Info("Add or update scanner")
 
 			if s.ID == share.CLUSScannerDBVersionID {
-				// Dummy scanner to indicate db version change. It should not stored in the map.
+				// Dummy scanner to indicate db version change. It should not be stored in the map.
 				newStore := fmt.Sprintf("%s%s/", share.CLUSScannerDBStore, s.CVEDBVersion)
 
-				newDB := &share.CLUSScannerDB{
+				// Write consul slots directly to SQLite one at a time — no full in-memory map is built.
+				// The iterate callback returns an error when no entries are found so that
+				// ReplaceCVEDB rolls back rather than committing an empty table (data-loss guard).
+				var totalEntries int
+				err := db.ReplaceCVEDB(s.CVEDBVersion, s.CVEDBCreateTime,
+					func(writeFn func(*share.CLUSScannerDB) error) error {
+						var iterErr error
+						totalEntries, iterErr = clusHelper.IterateScannerDB(newStore, writeFn)
+						if iterErr != nil {
+							return iterErr
+						}
+						if totalEntries == 0 {
+							return fmt.Errorf("no CVE entries found in store %s", newStore)
+						}
+						return nil
+					},
+				)
+				if err != nil {
+					log.WithFields(log.Fields{"error": err, "store": newStore, "version": s.CVEDBVersion}).Error("Failed to write scanner DB to SQLite")
+					return
+				}
+
+				// Invalidate the per-prefix cache AFTER the SQLite commit so that
+				// subsequent cache misses load from the newly-committed data.
+				db.GlobalCVECache().Invalidate()
+
+				log.WithFields(log.Fields{"cvedb": s.CVEDBVersion, "entries": totalEntries}).Info()
+
+				scanUtils.SetCVEDBMeta(s.CVEDBVersion, s.CVEDBCreateTime)
+				scan.ScannerDBChange(&share.CLUSScannerDB{
 					CVEDBVersion:    s.CVEDBVersion,
 					CVEDBCreateTime: s.CVEDBCreateTime,
-					CVEDB:           make(map[string]*share.ScanVulnerability),
-				}
-
-				// Reassemble
-				dbs := clusHelper.GetScannerDB(newStore)
-				for _, db := range dbs {
-					for _, cve := range db.CVEDB {
-						newDB.CVEDB[cve.Name] = cve
-					}
-				}
-
-				log.WithFields(log.Fields{"cvedb": newDB.CVEDBVersion, "entries": len(newDB.CVEDB)}).Info()
-
-				scanUtils.SetScannerDB(newDB)
-				scan.ScannerDBChange(newDB)
-				scannerDBChange(newDB.CVEDBVersion)
+				})
+				scannerDBChange(s.CVEDBVersion)
 			} else {
 				// Real Scanner
 				cacheMutexLock()
@@ -1316,7 +1360,7 @@ func ScanUpdateHandler(nType cluster.ClusterNotifyType, key string, value []byte
 	}
 }
 
-func scanLicenseUpdate(id string, param interface{}) {
+func initScanMap() {
 
 	// Cache lock must be within scan lock, so get the map first
 	wls := make(map[string]struct{ a, d string }, len(wlCacheMap))
@@ -1443,7 +1487,9 @@ func rescaleScanner(autoscaleCfg share.CLUSSystemConfigAutoscale, totalScanners 
 							ReportedAt: time.Now().UTC(),
 						}
 						clog.Msg = "Scanner autoscale is disabled because someone reverted the scaling for 3 continous times."
-						_ = cctx.EvQueue.Append(&clog)
+						if err := cctx.EvQueue.Append(&clog); err != nil {
+							log.WithError(err).Warn("failed to append autoscale disabled event to queue")
+						}
 						skipScale = true
 						log.Info(clog.Msg)
 					} else {
@@ -1514,9 +1560,7 @@ func (m CacheMethod) GetScanStatus(acc *access.AccessControl) (*api.RESTScanStat
 			status.Scanned++
 		}
 	}
-	sdb := scanUtils.GetScannerDB()
-	status.CVEDBVersion = sdb.CVEDBVersion
-	status.CVEDBCreateTime = sdb.CVEDBCreateTime
+	status.CVEDBVersion, status.CVEDBCreateTime = scanUtils.GetCVEDBMeta()
 	return &status, nil
 }
 
@@ -1580,9 +1624,7 @@ func scanBrief2REST(info *scanInfo) *api.RESTScanBrief {
 		}
 		r.BaseOS = info.baseOS
 	}
-	sdb := scanUtils.GetScannerDB()
-	r.CVEDBVersion = sdb.CVEDBVersion
-	r.CVEDBCreateTime = sdb.CVEDBCreateTime
+	r.CVEDBVersion, r.CVEDBCreateTime = scanUtils.GetCVEDBMeta()
 	return &r
 }
 
@@ -1596,16 +1638,14 @@ func (m CacheMethod) GetVulnerabilityReport(id, showTag string) ([]*api.RESTVuln
 			refreshScanCache(id, info, vpf)
 		}
 
-		sdb := scanUtils.GetScannerDB()
-
 		reportVuls, reportModules, err := db.GetVulnerabilityModule(id)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		localVulTraits := scanUtils.ExtractVulnerability(reportVuls)
+		localVulTraits := scanUtils.ExtractVulnerability(db.GlobalCVECache(), reportVuls)
 		vpf.FilterVulTraits(localVulTraits, info.idns)
-		vuls := scanUtils.FillVulTraits(sdb.CVEDB, info.baseOS, localVulTraits, showTag, false)
+		vuls := scanUtils.FillVulTraits(db.GlobalCVECache(), info.baseOS, localVulTraits, showTag, false)
 		modules := make([]*api.RESTScanModule, len(reportModules))
 		for i, m := range reportModules {
 			modules[i] = scanUtils.ScanModule2REST(m)

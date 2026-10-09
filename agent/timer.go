@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,7 @@ var threatMutex sync.Mutex
 var connectionMutex sync.Mutex
 var connsCache []*dp.ConnectionData
 var connsCacheMutex sync.Mutex
+var connsCacheDropped uint64 // low-priority connections dropped while connsCache was full
 var auditLogCache []*share.CLUSAuditLog
 var auditMutex sync.Mutex
 var fqdnIpCache []*share.CLUSFqdnIp
@@ -106,7 +108,11 @@ func statsLoop(bPassiveContainerDetect bool) {
 	for {
 		select {
 		case <-statsTicker:
-			system, _ := global.SYS.GetHostCPUUsage()
+			// Suppress error: called every 5 seconds in the stats loop
+			system, err := global.SYS.GetHostCPUUsage()
+			if err != nil {
+				log.WithError(err).Debug("Failed to get host CPU usage")
+			}
 			gInfoRLock()
 			updateAgentStats(system)
 			updateContainerStats(system)
@@ -167,11 +173,24 @@ func statsLoop(bPassiveContainerDetect bool) {
 	}
 }
 
+// writeClusterRunning guards against overlapping writeCluster() runs. Each tick
+// previously spawned a new goroutine unconditionally; if a run stalled (e.g. on a
+// slow connection drain), goroutines and their retained connection data piled up
+// without bound. Skip a tick when the previous run has not finished yet.
+var writeClusterRunning atomic.Bool
+
 func timerLoop() {
 	ticker := time.Tick(time.Second * time.Duration(reportInterval))
 	for {
 		<-ticker
-		go writeCluster()
+		if !writeClusterRunning.CompareAndSwap(false, true) {
+			log.Warn("Previous writeCluster still running -- skip this tick")
+			continue
+		}
+		go func() {
+			defer writeClusterRunning.Store(false)
+			writeCluster()
+		}()
 	}
 }
 
@@ -210,9 +229,7 @@ func dpTaskCallback(task *dp.DPTask) {
 		delete(ipFqdnStorageCache, ip)
 		ipFqdnStorageMutex.Unlock()
 	case dp.DP_TASK_CONNECTION:
-		connsCacheMutex.Lock()
-		connsCache = append(connsCache, task.Connects...)
-		connsCacheMutex.Unlock()
+		cacheConnections(task.Connects)
 	case dp.DP_TASK_HOST_CONNECTION:
 		updateHostConnection(task.Connects)
 	case dp.DP_TASK_APPLICATION:
@@ -228,10 +245,20 @@ func dpTaskCallback(task *dp.DPTask) {
 func updateAgentStats(cpuSystem uint64) {
 	var mem, cpu uint64 = 0, 0
 	if agentEnv.cgroupMemory != "" {
-		mem, _ = global.SYS.GetContainerMemoryUsage(agentEnv.cgroupMemory)
+		var err error
+		// Suppress error: called every 5 seconds in the stats loop
+		mem, err = global.SYS.GetContainerMemoryUsage(agentEnv.cgroupMemory)
+		if err != nil {
+			log.WithError(err).Debug("Failed to get agent memory usage")
+		}
 	}
 	if agentEnv.cgroupCPUAcct != "" {
-		cpu, _ = global.SYS.GetContainerCPUUsage(agentEnv.cgroupCPUAcct)
+		var err error
+		// Suppress error: called every 5 seconds in the stats loop
+		cpu, err = global.SYS.GetContainerCPUUsage(agentEnv.cgroupCPUAcct)
+		if err != nil {
+			log.WithError(err).Debug("Failed to get agent CPU usage")
+		}
 	}
 	system.UpdateStats(&gInfo.agentStats, mem, cpu, cpuSystem)
 }
@@ -241,10 +268,20 @@ func updateContainerStats(cpuSystem uint64) {
 	for _, c := range gInfo.activeContainers {
 		var mem, cpu uint64 = 0, 0
 		if c.cgroupMemory != "" {
-			mem, _ = global.SYS.GetContainerMemoryUsage(c.cgroupMemory)
+			var err error
+			// Suppress error: called per-container every 5 seconds, can be high-frequency
+			mem, err = global.SYS.GetContainerMemoryUsage(c.cgroupMemory)
+			if err != nil {
+				log.WithFields(log.Fields{"error": err, "cgroup": c.cgroupMemory}).Debug("Failed to get container memory usage")
+			}
 		}
 		if c.cgroupCPUAcct != "" {
-			cpu, _ = global.SYS.GetContainerCPUUsage(c.cgroupCPUAcct)
+			var err error
+			// Suppress error: called per-container every 5 seconds, can be high-frequency
+			cpu, err = global.SYS.GetContainerCPUUsage(c.cgroupCPUAcct)
+			if err != nil {
+				log.WithFields(log.Fields{"error": err, "cgroup": c.cgroupCPUAcct}).Debug("Failed to get container CPU usage")
+			}
 		}
 		system.UpdateStats(&c.stats, mem, cpu, cpuSystem)
 	}
@@ -260,7 +297,11 @@ func putFqdnIps() {
 
 	for _, fqdnip := range fqdnips {
 		key := share.CLUSFqdnIpKey(Host.ID, fqdnip.FqdnName)
-		value, _ := json.Marshal(fqdnip)
+		value, err := json.Marshal(fqdnip)
+		if err != nil {
+			log.WithError(err).Warn("Failed to marshal fqdnip")
+			continue
+		}
 		zb := utils.GzipBytes(value)
 		log.WithFields(log.Fields{"key": key, "fqdnip": fqdnip}).Debug("Put fqdn ip")
 		if err := cluster.PutBinary(key, zb); err != nil {
@@ -297,7 +338,11 @@ func putThreatLogs() {
 
 	if len(tlogs) > 0 {
 		key := share.CLUSThreatLogKey(Host.ID, Agent.ID)
-		value, _ := json.Marshal(tlogs)
+		value, err := json.Marshal(tlogs)
+		if err != nil {
+			log.WithError(err).Warn("Failed to marshal threat logs")
+			return
+		}
 		zb := utils.GzipBytes(value)
 		log.WithFields(log.Fields{"key": key}).Debug("Put threat log")
 		if err := cluster.PutBinary(key, zb); err != nil {
@@ -315,7 +360,11 @@ func putIncidentLogs() {
 
 	if len(tmp) > 0 {
 		key := share.CLUSIncidentLogKey(Host.ID, Agent.ID)
-		value, _ := json.Marshal(tmp)
+		value, err := json.Marshal(tmp)
+		if err != nil {
+			log.WithError(err).Warn("Failed to marshal incident logs")
+			return
+		}
 		zb := utils.GzipBytes(value)
 		log.WithFields(log.Fields{"key": key, "len": len(tmp)}).Debug("Put incident log")
 		if err := cluster.PutBinary(key, zb); err != nil {
@@ -333,7 +382,10 @@ func putAuditLogs() {
 
 	if len(tmp) > 0 {
 		key := share.CLUSAuditLogKey(Host.ID, Agent.ID)
-		value, _ := json.Marshal(tmp)
+		value, err := json.Marshal(tmp)
+		if err != nil {
+			log.WithError(err).Warn("failed to marshal audit log")
+		}
 		zb := utils.GzipBytes(value)
 		log.WithFields(log.Fields{"key": key, "len": len(tmp)}).Debug("Put audit log")
 		if err := cluster.PutBinary(key, zb); err != nil {
@@ -346,6 +398,68 @@ func putAuditLogs() {
 
 const connectionMapMax int = 2048 * 16
 
+// connsCache is the unbounded ingestion queue between dp (dpMsgConnection) and
+// updateConnection(). Cap it so a burst of new connections (e.g. a DNS flood)
+// cannot grow it without limit while the drain is slow. Low-priority connections
+// are dropped first once connsCacheMax is reached; high-priority ones (see
+// connIsHighPriority) are kept up to a hard ceiling so they still get reported.
+const connsCacheMax int = connectionMapMax * 8
+const connsCacheHardMax int = connsCacheMax * 2
+
+// connIsHighPriority reports whether a connection must be reported even under
+// load. Low-priority (OPEN/ALLOW/CHECK_*) connections are dropped first; a
+// connection is kept when it is:
+//   - LEARN so it can be learned into policy, or VIOLATE/DENY so violations
+//     are not lost;
+//   - a DNS-tunnel candidate: dp sets ClientPort only for large DNS/UDP
+//     sessions (ClientBytes > threshold), the ones fed to CheckDNSTunneling,
+//     so dropping them would defeat tunnel detection under load;
+//   - already carrying a dp-detected threat (Severity/ThreatID set), which
+//     must not be silently dropped regardless of its policy action.
+func connIsHighPriority(conn *dp.Connection) bool {
+	if conn.PolicyAction > C.DP_POLICY_ACTION_CHECK_APP ||
+		conn.PolicyAction == C.DP_POLICY_ACTION_LEARN {
+		return true
+	}
+	if conn.ClientPort != 0 {
+		return true
+	}
+	if conn.Severity > 0 || conn.ThreatID != 0 {
+		return true
+	}
+	return false
+}
+
+// cacheConnections appends dp connection reports to connsCache with a bound.
+// Once connsCacheMax is reached, only high-priority connections are kept (up to
+// connsCacheHardMax); everything else is counted in connsCacheDropped so the
+// queue cannot grow without limit when updateConnection() falls behind.
+func cacheConnections(conns []*dp.ConnectionData) {
+	connsCacheMutex.Lock()
+	defer connsCacheMutex.Unlock()
+	for _, cd := range conns {
+		if len(connsCache) < connsCacheMax ||
+			(connIsHighPriority(cd.Conn) && len(connsCache) < connsCacheHardMax) {
+			connsCache = append(connsCache, cd)
+		} else {
+			connsCacheDropped++
+		}
+	}
+}
+
+// drainConnsCache takes ownership of the current connsCache contents and resets
+// it to nil (releasing the backing array to the GC rather than retaining its
+// peak capacity), returning the drained connections and the dropped count.
+func drainConnsCache() ([]*dp.ConnectionData, uint64) {
+	connsCacheMutex.Lock()
+	defer connsCacheMutex.Unlock()
+	conns := connsCache
+	connsCache = nil
+	dropped := connsCacheDropped
+	connsCacheDropped = 0
+	return conns, dropped
+}
+
 func keyTCPUDPConnection(conn *dp.Connection) string {
 	return fmt.Sprintf("%v-%v-%v-%v-%v-%v-%v",
 		conn.ClientIP, conn.ServerIP, conn.ServerPort, conn.IPProto, conn.Ingress, conn.PolicyId, conn.Application)
@@ -357,10 +471,12 @@ func keyOtherConnection(conn *dp.Connection) string {
 }
 
 func updateConnection() {
-	connsCacheMutex.Lock()
-	conns := slices.Clone(connsCache)
-	connsCache = connsCache[:0]
-	connsCacheMutex.Unlock()
+	conns, dropped := drainConnsCache()
+
+	if dropped > 0 {
+		connLog.WithFields(log.Fields{"dropped": dropped, "processing": len(conns)}).
+			Warn("connsCache full -- dropped low-priority connections")
+	}
 
 	for _, data := range conns {
 		conn := data.Conn

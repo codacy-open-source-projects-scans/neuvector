@@ -31,8 +31,10 @@ type RegClient struct {
 func NewRegClient(url, token, username, password, proxy string, trace httptrace.HTTPTrace) *RegClient {
 	log.WithFields(log.Fields{"url": url}).Debug("")
 
-	// Ignore errors
-	hub, _, _ := registry.New(url, token, username, password, proxy, trace)
+	hub, _, err := registry.New(url, token, username, password, proxy, trace)
+	if err != nil {
+		log.WithError(err).Warn("failed to create registry client")
+	}
 	return &RegClient{Registry: hub}
 }
 
@@ -179,7 +181,8 @@ func (rc *RegClient) GetImageInfo(ctx context.Context, name, tag string, manifes
 		}
 	}
 
-	var v2SchemaError error = nil
+	var v2SchemaError error
+	var manifestConnErr error
 	if !isQuaySpecialCase {
 		if manifestReqType == registry.ManifestRequest_CosignSignature {
 			log.WithFields(log.Fields{"name": name, "tag": tag}).Debug("not quay special case, trying v2")
@@ -209,8 +212,12 @@ func (rc *RegClient) GetImageInfo(ctx context.Context, name, tag string, manifes
 				log.WithFields(log.Fields{"os": ml.Manifests[0].Platform.OS, "arch": ml.Manifests[0].Platform.Architecture, "tag": tag}).Debug("manifest list")
 
 				_, body, err = rc.ManifestRequest(ctx, name, tag, 2, manifestReqType)
+				if err != nil {
+					manifestConnErr = err
+				}
 			}
 		} else {
+			manifestConnErr = err
 			v2SchemaError = fmt.Errorf("error when requesting v2 manifest, will try v1: %s", err.Error())
 		}
 
@@ -303,7 +310,7 @@ func (rc *RegClient) GetImageInfo(ctx context.Context, name, tag string, manifes
 		log.WithFields(log.Fields{"imageInfo": imageInfo}).Error("Get metadata fail")
 
 		if imageInfo.ID == "" {
-			return imageInfo, share.ScanErrorCode_ScanErrImageNotFound
+			return imageInfo, classifyManifestErr(manifestConnErr)
 		} else {
 			return imageInfo, share.ScanErrorCode_ScanErrRegistryAPI
 		}
@@ -348,6 +355,24 @@ func (rc *RegClient) getSchemaV1Id(manV1 *manifestV1.SignedManifest) string {
 
 func (rc *RegClient) Alive() (uint, error) {
 	return rc.Ping()
+}
+
+// classifyManifestErr maps a manifest-request transport error to the appropriate
+// ScanErrorCode, distinguishing TLS/network failures from genuine missing-image errors.
+func classifyManifestErr(err error) share.ScanErrorCode {
+	if err == nil {
+		return share.ScanErrorCode_ScanErrImageNotFound
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "x509:") || strings.Contains(msg, "tls:") {
+		return share.ScanErrorCode_ScanErrCertificate
+	}
+	if strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "dial tcp") {
+		return share.ScanErrorCode_ScanErrNetwork
+	}
+	return share.ScanErrorCode_ScanErrImageNotFound
 }
 
 // GetCosignSignatureTagFromDigest takes an image digest and returns the default tag

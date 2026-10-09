@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -19,7 +20,6 @@ import (
 	"hash/fnv"
 	"io"
 	"math/big"
-	mathrand "math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -51,7 +51,7 @@ const cliAny string = "any"
 const reStrNonPrintable string = "[^\x20-\x7E]"
 const reStrURLReserved string = "[/?%& ]"
 
-const readyFile string = "/tmp/ready"
+const ReadyFile string = "/tmp/ready"
 
 var reNonPrintable, reURLReserved *regexp.Regexp
 
@@ -155,21 +155,30 @@ func GetGuid() (string, error) {
 }
 
 func GetTimeUUID(t time.Time) string {
-	uuid, _ := simpleuuid.NewTime(t)
+	uuid, err := simpleuuid.NewTime(t)
+	if err != nil {
+		log.WithError(err).Warn("failed to create time UUID")
+		return ""
+	}
 	return uuid.String()
 }
 
 func GetStringUUID(s string) string {
-	uuid, _ := simpleuuid.NewString(s)
+	uuid, err := simpleuuid.NewString(s)
+	if err != nil {
+		log.WithError(err).Warn("failed to create string UUID")
+		return ""
+	}
 	return uuid.String()
 }
 
-func GetRandomID(length int, prefix string) string {
+func GetRandomID(length int, prefix string) (string, error) {
 	id := make([]byte, length)
 	if _, err := rand.Read(id); err != nil {
 		log.WithFields(log.Fields{"err": err, "prefix": prefix}).Error()
+		return "", err
 	}
-	return fmt.Sprintf("%s%s", prefix, hex.EncodeToString(id))
+	return fmt.Sprintf("%s%s", prefix, hex.EncodeToString(id)), nil
 }
 
 func HashPassword(password string) string {
@@ -194,7 +203,10 @@ func GunzipBytes(buf []byte) []byte {
 		return nil
 	}
 	defer r.Close()
-	uzb, _ := io.ReadAll(r)
+	uzb, err := io.ReadAll(r)
+	if err != nil {
+		log.WithError(err).Warn("failed to read gzip data")
+	}
 	return uzb
 }
 
@@ -302,7 +314,11 @@ func NewEnvironParser(envs []string) *EnvironParser {
 				switch k {
 				case share.ENV_PLATFORM_INFO:
 					// platform=aliyun;if-eth0=local;if-eth1=global
-					p.platformEnv, _ = parseQuery(v)
+					var err error
+					p.platformEnv, err = parseQuery(v)
+					if err != nil {
+						log.WithError(err).Warn("failed to parse platform env")
+					}
 				case share.ENV_SYSTEM_GROUPS:
 					// NV_SYSTEM_GROUPS=ucp-*;calico-*
 					p.sysGroups = make([]*regexp.Regexp, 0)
@@ -829,7 +845,10 @@ func GetGID() uint64 {
 	b = b[:runtime.Stack(b, false)]
 	b = bytes.TrimPrefix(b, []byte("goroutine "))
 	b = b[:bytes.IndexByte(b, ' ')]
-	n, _ := strconv.ParseUint(string(b), 10, 64)
+	n, err := strconv.ParseUint(string(b), 10, 64)
+	if err != nil {
+		log.WithError(err).Debug("failed to parse goroutine ID")
+	}
 	return n
 }
 
@@ -866,14 +885,15 @@ OUTER:
 
 // -- Logger
 
+// LOG_FORMAT controls pod stdout log format for controller and agent.
+// Set to "json" for JSON lines; unset or any other value keeps the default text format.
+const logFormatEnv = "LOG_FORMAT"
+
 type LogFormatter struct {
 	Module string
 }
 
-func (f *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
-	// Skip 2, 0: callers(), 1: GetCaller, 2: LogFormatter()
-	fn := GetCaller(3, []string{"logrus"})
-
+func formatLogBody(entry *log.Entry, fn string) string {
 	var keys = make([]string, 0, len(entry.Data))
 	for k := range entry.Data {
 		keys = append(keys, k)
@@ -883,9 +903,7 @@ func (f *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 
 	b := &bytes.Buffer{}
 
-	fmt.Fprintf(b, "%-23s", entry.Time.Format("2006-01-02T15:04:05.999"))
-	fmt.Fprintf(b, "|%s|%s|%s:",
-		strings.ToUpper(entry.Level.String())[0:4], f.Module, fn)
+	fmt.Fprintf(b, "%s:", fn)
 	if len(entry.Message) > 0 {
 		fmt.Fprintf(b, " %s", entry.Message)
 	}
@@ -901,7 +919,37 @@ func (f *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
 		}
 	}
 
-	b.WriteByte('\n')
+	return b.String()
+}
+
+func (f *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
+	// Skip 2, 0: callers(), 1: GetCaller, 2: LogFormatter()
+	fn := GetCaller(3, []string{"logrus"})
+	level := strings.ToUpper(entry.Level.String())[0:4]
+	body := formatLogBody(entry, fn)
+
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(logFormatEnv)), "json") {
+		rec := struct {
+			Time   string `json:"time"`
+			Level  string `json:"level"`
+			Module string `json:"module"`
+			Log    string `json:"log"`
+		}{
+			Time:   entry.Time.Format("2006-01-02T15:04:05.999"),
+			Level:  level,
+			Module: f.Module,
+			Log:    body,
+		}
+		b, err := json.Marshal(rec)
+		if err != nil {
+			return nil, err
+		}
+		return append(b, '\n'), nil
+	}
+
+	b := &bytes.Buffer{}
+	fmt.Fprintf(b, "%-23s|%s|%s|%s\n",
+		entry.Time.Format("2006-01-02T15:04:05.999"), level, f.Module, body)
 	return b.Bytes(), nil
 }
 
@@ -922,11 +970,16 @@ func GetSupportedTLSCipherSuites() []uint16 {
 }
 
 func Encrypt(encryptionKey, text []byte) ([]byte, error) {
+	textLength := len(text)
+	if textLength >= (524288 - aes.BlockSize) {
+		return nil, fmt.Errorf("size too big: %v", textLength)
+	}
+	textLength += aes.BlockSize // max value: 512K
 	block, err := aes.NewCipher(encryptionKey)
 	if err != nil {
 		return nil, err
 	}
-	ciphertext := make([]byte, aes.BlockSize+len(text))
+	ciphertext := make([]byte, textLength)
 	iv := ciphertext[:aes.BlockSize]
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
 		return nil, err
@@ -974,27 +1027,6 @@ func DecryptFromBase64(encryptionKey []byte, b64 string) (string, error) {
 	}
 }
 
-func EncryptToRawStdBase64(key, text []byte) (string, error) {
-	if ciphertext, err := Encrypt(key, text); err == nil {
-		return base64.RawStdEncoding.EncodeToString(ciphertext), nil
-	} else {
-		return "", err
-	}
-}
-
-func DecryptFromRawStdBase64(key []byte, b64 string) (string, error) {
-	text, err := base64.RawStdEncoding.DecodeString(b64)
-	if err != nil {
-		return "", err
-	}
-
-	if text, err = Decrypt(key, text); err == nil {
-		return string(text), nil
-	} else {
-		return "", err
-	}
-}
-
 func EncryptToRawURLBase64(key, text []byte) (string, error) {
 	if ciphertext, err := Encrypt(key, text); err == nil {
 		return base64.RawURLEncoding.EncodeToString(ciphertext), nil
@@ -1020,44 +1052,31 @@ func getPasswordSymKey() []byte {
 	return passwordSymKey
 }
 
-func GetLicenseInfo(license string) (string, error) { // returns license json string
-	return "", nil
-}
-
 func DecryptPassword(encrypted string) string {
 	if encrypted == "" {
 		return ""
 	}
 
-	password, _ := DecryptFromBase64(getPasswordSymKey(), encrypted)
+	password, err := DecryptFromBase64(getPasswordSymKey(), encrypted)
+	if err != nil {
+		log.WithError(err).Warn("failed to decrypt password")
+	}
 	return password
 }
 
-func EncryptPassword(password string) string {
-	if password == "" {
-		return ""
-	}
-
-	encrypted, _ := EncryptToBase64(getPasswordSymKey(), []byte(password))
-	return encrypted
-}
-
-func DecryptSensitive(encrypted string, key []byte) string {
+func DecryptSensitive(encrypted string, key []byte) (string, error) {
 	if encrypted == "" {
-		return ""
+		return "", nil
 	}
-
-	data, _ := DecryptFromBase64(key, encrypted)
-	return data
+	return DecryptFromBase64(key, encrypted)
 }
 
-func EncryptSensitive(data string, key []byte) string {
+func EncryptSensitive(data string, key []byte) (string, error) {
 	if data == "" {
-		return ""
+		return "", nil
 	}
 
-	encrypted, _ := EncryptToBase64(key, []byte(data))
-	return encrypted
+	return EncryptToBase64(key, []byte(data))
 }
 
 func DecryptUserToken(encrypted string, key []byte) (string, error) {
@@ -1084,22 +1103,11 @@ func EncryptUserToken(token string, key []byte) (string, error) {
 	return EncryptToRawURLBase64(key, []byte(token))
 }
 
-func DecryptURLSafe(encrypted string) string {
+func DecryptURLSafe(encrypted string) (string, error) {
 	if encrypted == "" {
-		return ""
+		return "", nil
 	}
-
-	password, _ := DecryptFromRawURLBase64(getPasswordSymKey(), encrypted)
-	return password
-}
-
-func EncryptURLSafe(password string) string {
-	if password == "" {
-		return ""
-	}
-
-	encrypted, _ := EncryptToRawURLBase64(getPasswordSymKey(), []byte(password))
-	return encrypted
+	return DecryptFromRawURLBase64(getPasswordSymKey(), encrypted)
 }
 
 // Determine if a directory is a mountpoint, by comparing the device for the directory
@@ -1194,7 +1202,7 @@ func Exec(dir string, bin string, args ...string) ([]byte, error) {
 
 func SetReady(value string) error {
 	log.WithFields(log.Fields{"value": value}).Info("")
-	f, err := os.Create(readyFile)
+	f, err := os.Create(ReadyFile)
 	if err != nil {
 		log.WithFields(log.Fields{"error": err, "value": value}).Error("Unable to create ready file")
 		return err
@@ -1206,7 +1214,7 @@ func SetReady(value string) error {
 
 func UnsetReady() error {
 	log.Info("")
-	return os.Remove(readyFile)
+	return os.Remove(ReadyFile)
 }
 
 // Utilities: find group attribute from the grou's name definitions, based on controller/api/apis.go
@@ -1377,30 +1385,17 @@ func replaceAtIndex(in string, r rune, i int) string {
 func Dns1123NameChg(name string) string {
 	if !regCrdName.MatchString(name) {
 		length := len(name)
-		fmt.Println("string:", name, "failed regex with len ", length)
+		log.WithFields(log.Fields{"name": name, "len": length}).Debug("failed regex")
 		for i, char := range name {
 			if (i == 0 || i == length-1) && !regDns1122start.MatchString(string(char)) {
 				name = replaceAtIndex(name, '0', i)
 			} else if !regDns1122.MatchString(string(char)) {
-				fmt.Println("char:", string(char), "failed regex")
+				log.WithFields(log.Fields{"char": string(char)}).Debug("failed regex")
 				name = strings.ReplaceAll(name, string(char), "-")
 			}
 		}
 	}
 	return name
-}
-
-func RandomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyz"
-
-	var seededRand = mathrand.New(
-		mathrand.NewSource(time.Now().UnixNano()))
-
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[seededRand.Intn(len(charset))]
-	}
-	return string(b)
 }
 
 func CompressToZipFile(source, targetFile string) error {

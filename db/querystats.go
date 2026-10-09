@@ -3,7 +3,6 @@ package db
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"time"
 
 	"github.com/doug-martin/goqu/v9"
@@ -12,7 +11,7 @@ import (
 
 type QueryStat struct {
 	Db_ID        int
-	Token        string
+	QueryID      string
 	CreationTime int64
 	LoginID      string // APIKey will be different for each request..
 	LoginName    string
@@ -24,13 +23,11 @@ type QueryStat struct {
 	Type         int // QueryStateType_Vul(0), QueryStateType_Asset(1)
 }
 
-const queryStatTablename = "querystats"
-
 func PopulateQueryStat(queryStat *QueryStat) (int, error) {
 	dialect := goqu.Dialect("sqlite3")
-	ds := dialect.Insert(queryStatTablename).Rows(
+	ds := dialect.Insert(Table_querystats).Rows(
 		goqu.Record{
-			"token":            queryStat.Token,
+			"token":            queryStat.QueryID,
 			"create_timestamp": queryStat.CreationTime,
 			"login_type":       queryStat.LoginType,
 			"login_id":         queryStat.LoginID,
@@ -42,7 +39,10 @@ func PopulateQueryStat(queryStat *QueryStat) (int, error) {
 			"type":             queryStat.Type,
 		},
 	)
-	sql, args, _ := ds.Prepared(true).ToSQL()
+	sql, args, err := ds.Prepared(true).ToSQL()
+	if err != nil {
+		return 0, fmt.Errorf("failed to build query stat insert query: %w", err)
+	}
 
 	// execute the statement
 	var lastErr error
@@ -73,10 +73,16 @@ func PopulateQueryStat(queryStat *QueryStat) (int, error) {
 }
 
 func GetQueryStat(token string) (*QueryStat, error) {
+	if err := vaildateQueryID(token); err != nil {
+		return nil, err
+	}
 	dialect := goqu.Dialect("sqlite3")
 
 	columns := []interface{}{"id", "token", "create_timestamp", "login_type", "login_id", "login_name", "data1", "data2", "data3", "filedb_ready", "type"}
-	sql, args, _ := dialect.From(queryStatTablename).Select(columns...).Where(goqu.C("token").Eq(token)).Prepared(true).ToSQL()
+	sql, args, err := dialect.From(Table_querystats).Select(columns...).Where(goqu.C("token").Eq(token)).Prepared(true).ToSQL()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build query: %w", err)
+	}
 
 	var lastErr error
 	for retry := 0; retry < 50; retry++ {
@@ -93,7 +99,7 @@ func GetQueryStat(token string) (*QueryStat, error) {
 
 		stat := &QueryStat{}
 		if rows.Next() {
-			err = rows.Scan(&stat.Db_ID, &stat.Token, &stat.CreationTime, &stat.LoginType, &stat.LoginID,
+			err = rows.Scan(&stat.Db_ID, &stat.QueryID, &stat.CreationTime, &stat.LoginType, &stat.LoginID,
 				&stat.LoginName, &stat.Data1, &stat.Data2, &stat.Data3, &stat.FileDBReady, &stat.Type)
 			if err != nil {
 				return nil, err
@@ -123,8 +129,11 @@ func GetExceededSessions(loginName, loginID string, loginType int) ([]string, er
 	if loginType == 1 {
 		nLimit = 2 // apikey
 	}
-	// sql, args, _ := dialect.From(Table_querystats).Select(columns...).Where(goqu.And(expLoginName, expLoginId)).Order(goqu.C("create_timestamp").Desc()).Limit(100).Offset(uint(nLimit)).Prepared(true).ToSQL()
-	sql, args, _ := dialect.From(Table_querystats).Select(columns...).Where(goqu.And(expLoginName)).Order(goqu.C("create_timestamp").Desc()).Limit(100).Offset(uint(nLimit)).Prepared(true).ToSQL()
+	// sql, args, err := dialect.From(Table_querystats).Select(columns...).Where(goqu.And(expLoginName, expLoginId)).Order(goqu.C("create_timestamp").Desc()).Limit(100).Offset(uint(nLimit)).Prepared(true).ToSQL()
+	sql, args, err := dialect.From(Table_querystats).Select(columns...).Where(goqu.And(expLoginName)).Order(goqu.C("create_timestamp").Desc()).Limit(100).Offset(uint(nLimit)).Prepared(true).ToSQL()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build query: %w", err)
+	}
 
 	rows, err := dbHandle.Query(sql, args...)
 	if err != nil {
@@ -144,7 +153,10 @@ func GetExceededSessions(loginName, loginID string, loginType int) ([]string, er
 
 	// exceed 2 hours of create_timestamp
 	t := time.Now().UTC().Unix() - 7200
-	sql, args, _ = dialect.From(Table_querystats).Select(columns...).Where(goqu.Ex{"create_timestamp": goqu.Op{"lt": t}}).Prepared(true).ToSQL()
+	sql, args, err = dialect.From(Table_querystats).Select(columns...).Where(goqu.Ex{"create_timestamp": goqu.Op{"lt": t}}).Prepared(true).ToSQL()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build time-based query: %w", err)
+	}
 
 	rows, err = dbHandle.Query(sql, args...)
 	if err != nil {
@@ -165,15 +177,18 @@ func GetExceededSessions(loginName, loginID string, loginType int) ([]string, er
 	return records, nil
 }
 
-func setFileDbState(queryToken string, newValue int) error {
+func setFileDbState(queryID string, newValue int) error {
 	dialect := goqu.Dialect("sqlite3")
-	sql, args, _ := dialect.Update(queryStatTablename).Where(goqu.C("token").Eq(queryToken)).Set(
+	sql, args, err := dialect.Update(Table_querystats).Where(goqu.C("token").Eq(queryID)).Set(
 		goqu.Record{
 			"filedb_ready": newValue,
 		},
 	).Prepared(true).ToSQL()
+	if err != nil {
+		return fmt.Errorf("failed to build file db state update query: %w", err)
+	}
 
-	_, err := dbHandle.Exec(sql, args...)
+	_, err = dbHandle.Exec(sql, args...)
 	if err != nil {
 		return err
 	}
@@ -181,57 +196,68 @@ func setFileDbState(queryToken string, newValue int) error {
 	return nil
 }
 
-func DeleteQuerySessionByToken(queryToken string) error {
-	qs, err := GetQueryStat(queryToken)
+func DeleteQuerySessionByQueryID(queryID string) error {
+	qs, err := GetQueryStat(queryID)
 	if err != nil {
 		return err
 	}
 
 	// delete record in querystats table
 	dialect := goqu.Dialect("sqlite3")
-	sql, args, _ := dialect.Delete("querystats").Where(goqu.ExOr{"id": goqu.Op{"eq": qs.Db_ID}}).Prepared(true).ToSQL()
+	sql, args, err := dialect.Delete("querystats").Where(goqu.ExOr{"id": goqu.Op{"eq": qs.Db_ID}}).Prepared(true).ToSQL()
+	if err != nil {
+		return fmt.Errorf("failed to build query session delete query: %w", err)
+	}
 	_, err = dbHandle.Exec(sql, args...)
 	if err != nil {
 		return err
 	}
 
 	// delete session table in memory
-	err = deleteSessionTempTableInMemDb(queryToken)
-	if err != nil {
-		return err
+	err1 := deleteSessionTempTableInMemDb(queryID)
+	if err1 != nil {
+		err1 = fmt.Errorf("failed to delete temp table in memory: %w", err1)
 	}
 
 	// delete the session table in file-based db, ignore the error
-	if err := deleteSessionFileDb(queryToken); err != nil {
-		return err
+	err2 := deleteSessionFileDb(queryID)
+	if err2 != nil {
+		err2 = fmt.Errorf("failed to delete temp table file: %w", err2)
 	}
 
-	return nil
+	return errors.Join(err1, err2)
 }
 
-func deleteSessionTempTableInMemDb(queryToken string) error {
+func deleteSessionTempTableInMemDb(queryID string) error {
+	tableName, err := formatSessionTempTableName(queryID)
+	if err != nil {
+		return err
+	}
+	if !regexTempTableName.MatchString(tableName) {
+		return errors.New("invalid temp table name")
+	}
+
 	memdbMutex.Lock()
 	defer memdbMutex.Unlock()
 
 	db := memoryDbHandle
+	err = nil
 
 	// SQLite does not support parameterized substitution for table and column names, only for values.
-	if len(queryToken) == 12 && isValidSessionTableName(queryToken) {
-		for i := 0; i < 10; i++ {
-			sql := fmt.Sprintf("DROP TABLE IF EXISTS '%s';", formatSessionTempTableName(queryToken))
-			_, err := db.Exec(sql)
-			if err != nil {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			break
+	// tableName is in the format "tmp_session_%s" where the "%s" part is a hex-encoded string(consists of the 16 lowercase hexadecimal characters: 0123456789abcdef)
+	// that SQL injection is impossible thru it
+	sql := fmt.Sprintf("DROP TABLE IF EXISTS '%s';", tableName)
+	for i := 0; i < 10; i++ {
+		_, err = db.Exec(sql)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
+		break
+	}
+	if err != nil {
+		err = fmt.Errorf("too many failed attemps: %w", err)
 	}
 
-	return nil
-}
-
-func isValidSessionTableName(name string) bool {
-	match, _ := regexp.MatchString("^[a-f0-9]+$", name)
-	return match
+	return err
 }

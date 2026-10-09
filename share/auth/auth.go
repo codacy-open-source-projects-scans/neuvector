@@ -54,14 +54,21 @@ type RemoteAuthInterface interface {
 	OIDCAuth(coidc *share.CLUSServerOIDC, tokenData *api.RESTAuthToken) (map[string]interface{}, error)
 }
 
-func NewRemoteAuther(fakeTime *time.Time) RemoteAuthInterface {
+func NewRemoteAuther(fakeTime *time.Time, encryptState func(string) (string, error), decryptState func(string) (string, error)) RemoteAuthInterface {
+	if encryptState == nil || decryptState == nil {
+		panic("NewRemoteAuther: encryptState and decryptState must not be nil")
+	}
 	return &remoteAuth{
-		fakeTime: fakeTime,
+		fakeTime:     fakeTime,
+		encryptState: encryptState,
+		decryptState: decryptState,
 	}
 }
 
 type remoteAuth struct {
-	fakeTime *time.Time // For unit-tests
+	fakeTime     *time.Time
+	encryptState func(string) (string, error)
+	decryptState func(string) (string, error)
 }
 
 const defaultLDAPAuthTimeout = time.Second * 10
@@ -115,14 +122,21 @@ func (a *remoteAuth) LDAPAuth(cldap *share.CLUSServerLDAP, username, password st
 		client.GroupFilter = fmt.Sprintf(ldapGroupFilter, cldap.GroupMemberAttr, username)
 	}
 
-	groups, _ := client.GetGroupsOfUser()
+	groups, err := client.GetGroupsOfUser()
+	if err != nil {
+		log.WithError(err).Warn("failed to get LDAP groups")
+	}
 	log.WithFields(log.Fields{"filter": client.GroupFilter, "groups": groups}).Debug("group member query")
 
 	// add nested group query for MSAD
 	if cldap.Type == api.ServerLDAPTypeMSAD {
 		client.GroupFilter = fmt.Sprintf(adNestedGroupFilter, dn)
 
-		groups2, _ := client.GetGroupsOfUser()
+		var groups2 []string
+		groups2, err = client.GetGroupsOfUser()
+		if err != nil {
+			log.WithError(err).Warn("failed to get LDAP nested groups")
+		}
 		log.WithFields(log.Fields{"filter": client.GroupFilter, "groups": groups2}).Debug("nested group member query")
 
 		groups = append(groups, groups2...)
@@ -139,7 +153,10 @@ func (a *remoteAuth) LDAPAuth(cldap *share.CLUSServerLDAP, username, password st
 		}
 
 		log.WithFields(log.Fields{"filter": client.GroupFilter}).Debug("group member query")
-		groups, _ = client.GetGroupsOfUser()
+		groups, err = client.GetGroupsOfUser()
+		if err != nil {
+			log.WithError(err).Warn("failed to get LDAP groups on retry")
+		}
 	}
 
 	return attrs, groups, nil
@@ -191,7 +208,7 @@ func GenerateSamlSP(csaml *share.CLUSServerSAML, spissuer string, redirurl strin
 		clockOverride = dsig.NewFakeClock(clockwork.NewFakeClockAt(*timeOverride))
 	}
 
-	return &saml2.SAMLServiceProvider{
+	sp := &saml2.SAMLServiceProvider{
 		IdentityProviderSSOURL: csaml.SSOURL,
 		IdentityProviderSLOURL: csaml.SLOURL,
 
@@ -211,7 +228,12 @@ func GenerateSamlSP(csaml *share.CLUSServerSAML, spissuer string, redirurl strin
 		// 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified' for the app
 		NameIdFormat: "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
 		Clock:        clockOverride,
-	}, nil
+	}
+	if csaml.AudienceURI != "" {
+		sp.AudienceURI = csaml.AudienceURI
+	}
+
+	return sp, nil
 }
 
 func (a *remoteAuth) SAMLSPGetRedirectURL(csaml *share.CLUSServerSAML, redir *api.RESTTokenRedirect, overrides map[string]string) (string, error) {
@@ -301,8 +323,15 @@ func (a *remoteAuth) SAMLSPAuth(csaml *share.CLUSServerSAML, tokenData *api.REST
 		return "", "", map[string][]string{}, err
 	}
 
-	if assertionInfo.WarningInfo.InvalidTime {
-		return "", "", map[string][]string{}, errors.New("invalid time")
+	w := assertionInfo.WarningInfo
+	if w.InvalidTime || w.OneTimeUse {
+		return "", "", map[string][]string{}, errors.New("invalid time/one time use")
+	}
+	if w.NotInAudience {
+		if csaml.AudienceURI != "" {
+			return "", "", map[string][]string{}, errors.New("invalid audience")
+		}
+		log.Warn("AudienceURI not configured")
 	}
 
 	out := map[string][]string{}
@@ -340,17 +369,28 @@ func (a *remoteAuth) OIDCDiscover(issuer string, proxy string) (string, string, 
 	return "", "", "", "", lastError
 }
 
-func (a *remoteAuth) generateState() string {
+func (a *remoteAuth) generateState() (string, error) {
 	s := fmt.Sprintf("%d", time.Now().Unix())
-	return utils.EncryptURLSafe(s)
+	return a.encryptState(s)
 }
 
 func (a *remoteAuth) verifyState(state string) error {
-	if tsStr := utils.DecryptURLSafe(state); tsStr == "" {
+	tsStr, err := a.decryptState(state)
+	if err != nil {
+		// fall back to legacy decryption for states generated before this migration
+		tsStr, err = utils.DecryptURLSafe(state)
+		if err != nil {
+			return fmt.Errorf("Invalid state: wrong encryption: %w", err)
+		}
+	}
+	if tsStr == "" {
 		return errors.New("Invalid state: wrong encryption")
-	} else if ts, err := strconv.ParseInt(tsStr, 10, 64); err != nil {
+	}
+	ts, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
 		return errors.New("Invalid state: wrong format")
-	} else if time.Now().Unix()-ts > stateTimeout {
+	}
+	if time.Now().Unix()-ts > stateTimeout {
 		return errors.New("Invalid state: expired")
 	}
 	return nil
@@ -363,7 +403,11 @@ func (a *remoteAuth) OIDCGetRedirectURL(coidc *share.CLUSServerOIDC, redir *api.
 		Endpoint:     oauth2.Endpoint{AuthURL: coidc.AuthURL, TokenURL: coidc.TokenURL},
 		Scopes:       coidc.Scopes,
 	}
-	url := fmt.Sprintf("%s&redirect_uri=%s", cfg.AuthCodeURL(a.generateState()), redir.Redirect)
+	state, err := a.generateState()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate state: %w", err)
+	}
+	url := fmt.Sprintf("%s&redirect_uri=%s", cfg.AuthCodeURL(state), redir.Redirect)
 	return url, nil
 }
 

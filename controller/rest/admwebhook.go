@@ -2,10 +2,8 @@ package rest
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,11 +80,6 @@ type WebhookServer struct {
 	reloadChan     chan int
 }
 
-type ContainerImage struct {
-	registry  string
-	imageRepo string
-}
-
 var admResCache = make(map[string]*nvsysadmission.AdmResObject) // key is the resource object id (object.metadata.uid)
 var admResCacheMutex sync.RWMutex
 
@@ -117,12 +110,6 @@ const (
 	K8sKindClusterRoleBinding    = "ClusterRoleBinding"
 	k8sKindPersistentVolumeClaim = "PersistentVolumeClaim"
 )
-
-var sidecarImages = []*ContainerImage{
-	{registry: "https://gcr.io/", imageRepo: "istio-release/proxyv2"},
-	{registry: "https://gcr.io/", imageRepo: "linkerd-io/proxy"},
-	{registry: "https://docker.io/", imageRepo: "istio/proxyv2"},
-}
 
 func checkAggrLogsCache(alwaysFlush bool) {
 	var err error
@@ -534,21 +521,7 @@ func parsePodSpec(objectMeta *metav1.ObjectMeta, spec *corev1.PodSpec) ([3][]*nv
 			if err := parseReqImageName(admContainerInfo); err != nil {
 				log.WithFields(log.Fields{"error": err}).Error("parseReqImageName")
 			}
-			isSidecar := false
-			for imageRegistry := range admContainerInfo.ImageRegistry.Iter() {
-				for _, sidecar := range sidecarImages {
-					if sidecar.registry == imageRegistry && sidecar.imageRepo == admContainerInfo.ImageRepo {
-						isSidecar = true
-						break
-					}
-				}
-				if isSidecar {
-					break
-				}
-			}
-			if !isSidecar {
-				allContainers[i] = append(allContainers[i], admContainerInfo)
-			}
+			allContainers[i] = append(allContainers[i], admContainerInfo)
 		}
 	}
 
@@ -696,12 +669,20 @@ func parseAdmRequest(req *admissionv1beta1.AdmissionRequest, objectMeta *metav1.
 	if podSpec != nil {
 		switch ps := podSpec.(type) {
 		case *corev1.PodTemplateSpec:
-			allContainers, _ = parsePodSpec(objectMeta, &ps.Spec)
+			var err error
+			allContainers, err = parsePodSpec(objectMeta, &ps.Spec)
+			if err != nil {
+				log.WithError(err).Warn("failed to parse pod spec")
+			}
 			specLabels = ps.Labels
 			specAnnotations = ps.Annotations
 			saName = ps.Spec.ServiceAccountName
 		case *corev1.PodSpec:
-			allContainers, _ = parsePodSpec(objectMeta, ps)
+			var err error
+			allContainers, err = parsePodSpec(objectMeta, ps)
+			if err != nil {
+				log.WithError(err).Warn("failed to parse pod spec")
+			}
 			saName = ps.ServiceAccountName
 		default:
 			return nil, errors.New("unsupported podSpec type")
@@ -1116,7 +1097,11 @@ func (whsvr *WebhookServer) validate(ar *admissionv1beta1.AdmissionReview, globa
 		if len(pod.OwnerReferences) != 0 && pod.Status.Phase == "Running" {
 			return composeResponse(nil), nil, reqIgnored
 		}
-		admResObject, _ = parseAdmRequest(req, &pod.ObjectMeta, &pod.Spec)
+		var err error
+		admResObject, err = parseAdmRequest(req, &pod.ObjectMeta, &pod.Spec)
+		if err != nil {
+			log.WithError(err).Warn("failed to parse admission request for pod")
+		}
 	case k8sKindPersistentVolumeClaim:
 		var pvc corev1.PersistentVolumeClaim
 		if err := json.Unmarshal(req.Object.Raw, &pvc); err != nil {
@@ -1140,10 +1125,14 @@ func (whsvr *WebhookServer) validate(ar *admissionv1beta1.AdmissionReview, globa
 
 	// parse request meta object
 	if objectMeta != nil {
+		var parseErr error
 		if req.Kind.Kind == k8sKindPersistentVolumeClaim {
-			admResObject, _ = parseAdmRequest(req, objectMeta, nil)
+			admResObject, parseErr = parseAdmRequest(req, objectMeta, nil)
 		} else if podTemplateSpec != nil {
-			admResObject, _ = parseAdmRequest(req, objectMeta, podTemplateSpec)
+			admResObject, parseErr = parseAdmRequest(req, objectMeta, podTemplateSpec)
+		}
+		if parseErr != nil {
+			log.WithError(parseErr).Warn("failed to parse admission request")
 		}
 	}
 	stamps.Parsed = time.Now()
@@ -1505,8 +1494,7 @@ func loadX509KeyPair(svcName string) (tls.Certificate, error) {
 		if cert, _, err = clusHelper.GetObjectCertRev(cn); !cert.IsEmpty() {
 			keyPEMBlock := []byte(cert.Key)
 			certPEMBlock := []byte(cert.Cert)
-			b := sha256.Sum256(certPEMBlock)
-			log.WithFields(log.Fields{"svcName": svcName, "cert": hex.EncodeToString(b[:])}).Info("sha256")
+			log.WithFields(log.Fields{"svcName": svcName}).Info()
 			// admission.SetCABundle(svcName, certPEMBlock) //->
 
 			return tls.X509KeyPair(certPEMBlock, keyPEMBlock)
@@ -1573,16 +1561,19 @@ func k8sWebhookRestServer(svcName string, port uint, clientAuth, debug bool) {
 
 	listenPortTLS := fmt.Sprintf(":%d", port)
 
-	pair, _ := loadX509KeyPair(svcName)
+	pair, err := loadX509KeyPair(svcName)
+	if err != nil {
+		log.WithFields(log.Fields{"svcName": svcName, "error": err}).Error("Failed to load X509 key pair")
+		return
+	}
 
 	whsvr := &WebhookServer{
 		dumpRequestObj: debug,
 		server: &http.Server{
 			Addr: listenPortTLS,
 			TLSConfig: &tls.Config{
-				Certificates:             []tls.Certificate{pair},
-				PreferServerCipherSuites: true,
-				MinVersion:               tls.VersionTLS12,
+				Certificates: []tls.Certificate{pair},
+				MinVersion:   tls.VersionTLS13,
 				CurvePreferences: []tls.CurveID{
 					tls.CurveP256,
 					tls.X25519,
@@ -1622,7 +1613,7 @@ func k8sWebhookRestServer(svcName string, port uint, clientAuth, debug bool) {
 		caCertPool.AppendCertsFromPEM(caCert)
 		whsvr.server.TLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
 		whsvr.server.TLSConfig.ClientCAs = caCertPool
-		whsvr.server.TLSConfig.MinVersion = tls.VersionTLS11
+		whsvr.server.TLSConfig.MinVersion = tls.VersionTLS13
 	}
 
 	// define http server and server handler

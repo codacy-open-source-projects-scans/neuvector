@@ -252,6 +252,9 @@ func HashPassword(password string, salt []byte) (string, error) {
 	return cipherBundle, nil
 }
 
+func AesGcmEncrypt(plaintext string) (string, error)    { return aesGcmEncrypt(plaintext) }
+func AesGcmDecrypt(cipherBundle string) (string, error) { return aesGcmDecrypt(cipherBundle) }
+
 func aesGcmEncrypt(plaintext string) (string, error) {
 	if plaintext == "" {
 		return "", ErrEmptyValue
@@ -476,7 +479,7 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.Uint() == 0
 	case reflect.Float32, reflect.Float64:
 		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
+	case reflect.Interface, reflect.Pointer:
 		return v.IsNil()
 	}
 	return false
@@ -494,11 +497,11 @@ func unmarshal(cloak string, data interface{}, reEncryptRequired *bool, unmarsha
 	v := reflect.ValueOf(data)
 	t := v.Type()
 
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		// follow pointer
 		t = t.Elem()
 	}
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		// follow pointer
 		v = v.Elem()
 	}
@@ -526,7 +529,7 @@ func unmarshal(cloak string, data interface{}, reEncryptRequired *bool, unmarsha
 			continue
 		}
 
-		if val.Kind() == reflect.Ptr {
+		if val.Kind() == reflect.Pointer {
 			val = val.Elem()
 		}
 
@@ -590,7 +593,7 @@ func unmarshalValue(cloak string, v reflect.Value, reEncryptRequired *bool, unma
 	}
 
 	k := v.Kind()
-	if k == reflect.Ptr {
+	if k == reflect.Pointer {
 		v = v.Elem()
 		k = v.Kind()
 	}
@@ -636,11 +639,11 @@ func marshal(cloak string, data interface{}, marshalResult tMarshallResult) (int
 	v := reflect.ValueOf(data)
 	t := v.Type()
 
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		// follow pointer
 		t = t.Elem()
 	}
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		// follow pointer
 		v = v.Elem()
 	}
@@ -673,7 +676,7 @@ func marshal(cloak string, data interface{}, marshalResult tMarshallResult) (int
 			continue
 		}
 
-		if val.Kind() == reflect.Ptr {
+		if val.Kind() == reflect.Pointer {
 			val = val.Elem()
 		}
 
@@ -702,10 +705,9 @@ func marshal(cloak string, data interface{}, marshalResult tMarshallResult) (int
 								if err == ErrEmptyValue {
 									marshalResult.AddEmptyFieldToEncrypt(jsonTag)
 								}
-								m = utils.EncryptPassword(strVal)
 							}
 						} else {
-							m = utils.EncryptPassword(strVal)
+							log.Error("dek seed is not available")
 						}
 					}
 					val = reflect.ValueOf(m)
@@ -748,7 +750,7 @@ func marshalValue(cloak string, v reflect.Value, marshalResult tMarshallResult) 
 	}
 
 	k := v.Kind()
-	if k == reflect.Ptr {
+	if k == reflect.Pointer {
 		v = v.Elem()
 		val = v.Interface()
 		k = v.Kind()
@@ -789,7 +791,8 @@ func marshalValue(cloak string, v reflect.Value, marshalResult tMarshallResult) 
 			return dest, nil
 		}
 		if mapKeys[0].Kind() != reflect.String {
-			return nil, MarshalInvalidTypeError{t: mapKeys[0].Kind(), data: val}
+			// Do not include val as it could be sensitive.
+			return nil, MarshalInvalidTypeError{t: mapKeys[0].Kind()}
 		}
 		for _, key := range mapKeys {
 			d, err := marshalValue(cloak, v.MapIndex(key), marshalResult)

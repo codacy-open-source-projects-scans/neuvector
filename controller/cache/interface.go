@@ -14,6 +14,7 @@ import (
 
 type CacheInterface interface {
 	GetRiskScoreMetrics(acc, accCaller *access.AccessControl) *api.RESTScoreMetricsData
+	SendExposureReport(acc, accCaller *access.AccessControl, domain string) error
 
 	GetAllHosts(acc *access.AccessControl) []*api.RESTHost
 	GetAllHostsRisk(acc *access.AccessControl) []*common.WorkloadRisk
@@ -123,9 +124,6 @@ type CacheInterface interface {
 	GetIncidentCount(acc *access.AccessControl) int
 	GetAudits(acc *access.AccessControl) []*api.Audit
 	GetAuditCount(acc *access.AccessControl) int
-
-	// License
-	GetCurrentLicense(acc *access.AccessControl) api.RESTLicenseInfo
 
 	// Process profile
 	GetProcessProfile(group string, acc *access.AccessControl) (*api.RESTProcessProfile, error)

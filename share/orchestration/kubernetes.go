@@ -244,7 +244,7 @@ func GetK8sVersion(reGetK8sVersion, reGetOcVersion bool) (string, string) {
 			}
 		}
 		if ocVer == "" && err != nil && !strings.HasPrefix(err.Error(), "Read File fail") {
-			log.Error(err.Error())
+			log.Warn(err.Error())
 		}
 	}
 
@@ -357,7 +357,7 @@ func (d *kubernetes) GetServiceFromPodLabels(namespace, pod, node string, labels
 		return nil
 	}
 
-	if seviceName, ok := labels[container.NeuvectorSetServiceName]; ok {
+	if seviceName, ok := labels[container.NeuvectorSetServiceName]; ok && CustomServiceNameEnabled() {
 		return &Service{Domain: namespace, Name: utils.Dns1123NameChg(strings.ToLower(seviceName))}
 	}
 

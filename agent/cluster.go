@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -46,7 +47,7 @@ func waitForAdmission() error {
 	maxRetry := 60
 	retry := 0
 
-	print := true
+	loggedOnce := true
 	for {
 		if val, err := cluster.Get(share.CLUSCtrlNodeAdmissionKey); err != nil || string(val) != share.CLUSCtrlEnabledValue {
 			time.Sleep(shortWait)
@@ -54,9 +55,9 @@ func waitForAdmission() error {
 		} else {
 			break
 		}
-		if print {
+		if loggedOnce {
 			log.Error("Node admission is not enabled yet")
-			print = false
+			loggedOnce = false
 		}
 		if retry > maxRetry {
 			// we can get here if the license is not loaded
@@ -355,14 +356,22 @@ func putLocalInfo() {
 		return
 	}
 
-	value, _ := json.Marshal(Host)
+	value, err := json.Marshal(Host)
+	if err != nil {
+		log.WithError(err).Warn("Failed to marshal host info")
+		return
+	}
 	key := share.CLUSHostKey(Host.ID, "agent")
 	if err := cluster.Put(key, value); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("")
 	}
 
 	Agent.ClusterIP = selfAddr
-	value, _ = json.Marshal(Agent)
+	value, err = json.Marshal(Agent)
+	if err != nil {
+		log.WithError(err).Warn("Failed to marshal agent info")
+		return
+	}
 	key = share.CLUSAgentKey(Host.ID, Agent.ID)
 	if err := cluster.Put(key, value); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("")
@@ -372,7 +381,11 @@ func putLocalInfo() {
 func putHostIfInfo() {
 	log.Debug()
 
-	value, _ := json.Marshal(Host)
+	value, err := json.Marshal(Host)
+	if err != nil {
+		log.WithError(err).Warn("Failed to marshal host info")
+		return
+	}
 	key := share.CLUSHostKey(Host.ID, "agent")
 	if err := cluster.Put(key, value); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("")
@@ -390,7 +403,11 @@ func deleteAgentInfo() {
 
 // PUT-KEY: object/networkep/<host_id>/<id>
 func putNetworkEP(nep *share.CLUSNetworkEP) {
-	value, _ := json.Marshal(nep)
+	value, err := json.Marshal(nep)
+	if err != nil {
+		log.WithError(err).Warn("Failed to marshal network endpoint")
+		return
+	}
 	key := share.CLUSNetworkEPKey(Host.ID, nep.ID)
 	if err := cluster.Put(key, value); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("")
@@ -406,7 +423,11 @@ func deleteNetworkEP(nepID string) {
 
 // PUT-KEY: object/workload/<host_id>/<id>
 func putWorkload(wl *share.CLUSWorkload) {
-	value, _ := json.Marshal(wl)
+	value, err := json.Marshal(wl)
+	if err != nil {
+		log.WithError(err).Warn("Failed to marshal workload")
+		return
+	}
 	key := share.CLUSWorkloadKey(Host.ID, wl.ID)
 	if err := cluster.Put(key, value); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("")
@@ -434,38 +455,36 @@ func putContainerForStop(info *container.ContainerMetaExtra, wl *share.CLUSWorkl
 
 func createWorkload(info *container.ContainerMetaExtra, svc, domain *string) *share.CLUSWorkload {
 	wl := share.CLUSWorkload{
-		ID:           info.ID,
-		Name:         info.Name,
-		SelfHostname: info.Hostname,
-		AgentID:      Agent.ID,
-		HostName:     Host.Name,
-		HostID:       Host.ID,
-		Image:        info.Image,
-		ImageID:      info.ImageID,
-		ImgCreateAt:  info.ImgCreateAt,
-		Author:       info.Author,
-		NetworkMode:  info.NetMode,
-		Privileged:   info.Privileged,
-		RunAsRoot:    info.RunAsRoot,
-		CreatedAt:    info.CreatedAt,
-		StartedAt:    info.StartedAt,
-		FinishedAt:   info.FinishedAt,
-		Running:      info.Running,
-		ExitCode:     info.ExitCode,
-		Pid:          info.Pid,
-		Inline:       false,
-		Labels:       info.Labels,
-		MemoryLimit:  info.MemoryLimit,
-		CPUs:         info.CPUs,
-		ProxyMesh:    info.ProxyMesh,
-		Sidecar:      info.Sidecar,
-		Ifaces:       make(map[string][]share.CLUSIPAddr),
-		Ports:        make(map[string]share.CLUSMappedPort),
-		Apps:         make(map[string]share.CLUSApp),
-	}
-	if info.ImageDigest != "" {
-		wl.ImageDigest = []string{info.ImageDigest}
-		wl.ImageDigest = append(wl.ImageDigest, info.ImageDigestExtra...)
+		ID:               info.ID,
+		Name:             info.Name,
+		SelfHostname:     info.Hostname,
+		AgentID:          Agent.ID,
+		HostName:         Host.Name,
+		HostID:           Host.ID,
+		Image:            info.Image,
+		ImageID:          info.ImageID,
+		ImageDigest:      info.ImageDigest,
+		ImageRepoDigests: info.ImageRepoDigests,
+		ImgCreateAt:      info.ImgCreateAt,
+		Author:           info.Author,
+		NetworkMode:      info.NetMode,
+		Privileged:       info.Privileged,
+		RunAsRoot:        info.RunAsRoot,
+		CreatedAt:        info.CreatedAt,
+		StartedAt:        info.StartedAt,
+		FinishedAt:       info.FinishedAt,
+		Running:          info.Running,
+		ExitCode:         info.ExitCode,
+		Pid:              info.Pid,
+		Inline:           false,
+		Labels:           info.Labels,
+		MemoryLimit:      info.MemoryLimit,
+		CPUs:             info.CPUs,
+		ProxyMesh:        info.ProxyMesh,
+		Sidecar:          info.Sidecar,
+		Ifaces:           make(map[string][]share.CLUSIPAddr),
+		Ports:            make(map[string]share.CLUSMappedPort),
+		Apps:             make(map[string]share.CLUSApp),
 	}
 
 	if wl.Running {
@@ -574,10 +593,8 @@ func updateContainer(ev *ClusterEvent, wl *share.CLUSWorkload) {
 	}
 	if ev.info != nil {
 		wl.ProxyMesh = ev.info.ProxyMesh
-		if ev.info.ImageDigest != "" {
-			wl.ImageDigest = []string{ev.info.ImageDigest}
-			wl.ImageDigest = append(wl.ImageDigest, ev.info.ImageDigestExtra...)
-		}
+		wl.ImageDigest = ev.info.ImageDigest
+		wl.ImageRepoDigests = ev.info.ImageRepoDigests
 	}
 }
 
@@ -674,7 +691,7 @@ func clusterUpdateContainer(ev *ClusterEvent) {
 	putWorkload(cache.wl)
 }
 
-func clusterRefreshContainers() {
+func clusterRefreshContainers() error {
 	log.Debug("")
 
 	// Remove non-existing containers from cluster
@@ -684,7 +701,10 @@ func clusterRefreshContainers() {
 	}
 
 	store := share.CLUSWorkloadHostStore(Host.ID)
-	keys, _ := cluster.GetStoreKeys(store)
+	keys, err := cluster.GetStoreKeys(store)
+	if err != nil {
+		return fmt.Errorf("failed to get workload store keys: %w", err)
+	}
 	for _, key := range keys {
 		id := share.CLUSWorkloadKey2ID(key)
 		if !existing.Contains(id) {
@@ -698,9 +718,10 @@ func clusterRefreshContainers() {
 	for _, cache := range wlCacheMap {
 		putWorkload(cache.wl)
 	}
+	return nil
 }
 
-func clusterEventHandler(ev *ClusterEvent) {
+func clusterEventHandler(ev *ClusterEvent) error {
 	log.WithFields(log.Fields{"event": ClusterEventName[ev.event]}).Debug("start")
 	switch ev.event {
 	case EV_ADD_CONTAINER:
@@ -710,11 +731,14 @@ func clusterEventHandler(ev *ClusterEvent) {
 	case EV_DEL_CONTAINER:
 		clusterDelContainer(ev.id)
 	case EV_REFRESH_CONTAINERS:
-		clusterRefreshContainers()
+		if err := clusterRefreshContainers(); err != nil {
+			return fmt.Errorf("failed to refresh containers in cluster: %w", err)
+		}
 	case EV_UPDATE_CONTAINER:
 		clusterUpdateContainer(ev)
 	}
 	log.WithFields(log.Fields{"event": ClusterEventName[ev.event]}).Debug("Done")
+	return nil
 }
 
 func uploadCurrentInfo() {
@@ -755,9 +779,12 @@ func leadChangeHandler(newLead, oldLead string) {
 	}
 }
 
-func getControllerFromCluster(ip string) *share.CLUSController {
+func getControllerFromCluster(ip string) (*share.CLUSController, error) {
 	store := share.CLUSControllerStore
-	keys, _ := cluster.GetStoreKeys(store)
+	keys, err := cluster.GetStoreKeys(store)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get controller store keys: %w", err)
+	}
 	for _, key := range keys {
 		if value, err := cluster.Get(key); err == nil {
 			var ctrl share.CLUSController
@@ -765,31 +792,38 @@ func getControllerFromCluster(ip string) *share.CLUSController {
 				log.WithFields(log.Fields{"dbgError": dbgError}).Debug()
 			}
 			if ctrl.ClusterIP == ip {
-				return &ctrl
+				return &ctrl, nil
 			}
 		} else {
 			log.WithFields(log.Fields{"err": err}).Debug("")
 		}
 	}
-	return nil
+	return nil, nil
 }
 
-func getLeadGRPCEndpoint() string {
+func getLeadGRPCEndpoint() (string, error) {
 	// Assume leadGrpcPort is not changed, so we only grab it once
 	if leadGrpcPort == 0 {
-		if ctrler := getControllerFromCluster(leadAddr); ctrler != nil {
+		ctrler, err := getControllerFromCluster(leadAddr)
+		if err != nil {
+			return "", fmt.Errorf("failed to get controller from cluster: %w", err)
+		}
+		if ctrler != nil {
 			leadGrpcPort = ctrler.RPCServerPort
 		}
 	}
 	if leadAddr == "" || leadGrpcPort == 0 {
-		return ""
+		return "", nil
 	}
-	return fmt.Sprintf("%s:%v", leadAddr, leadGrpcPort)
+	return fmt.Sprintf("%s:%v", leadAddr, leadGrpcPort), nil
 }
 
-func clusterLoop(existing utils.Set) {
+func clusterLoop(existing utils.Set) error {
 	// Remove non-existing containers from cluster
-	keys, _ := cluster.GetStoreKeys(share.CLUSWorkloadHostStore(Host.ID))
+	keys, err := cluster.GetStoreKeys(share.CLUSWorkloadHostStore(Host.ID))
+	if err != nil && !errors.Is(err, cluster.ErrEmptyStore) {
+		return fmt.Errorf("failed to get workload store keys for cleanup: %w", err)
+	}
 	txn := cluster.Transact()
 	for _, key := range keys {
 		if !existing.Contains(share.CLUSWorkloadKey2ID(key)) {
@@ -811,7 +845,9 @@ func clusterLoop(existing utils.Set) {
 			}
 			ev := <-ClusterEventChan
 			if ev.event != EV_CLUSTER_EXIT {
-				clusterEventHandler(ev)
+				if err := clusterEventHandler(ev); err != nil {
+					log.WithError(err).Warn("Failed to handle cluster event")
+				}
 			}
 		}
 
@@ -845,6 +881,7 @@ func clusterLoop(existing utils.Set) {
 		cluster.RegisterStoreWatcher(share.CLUSConfigDomainStore, domainConfigUpdate, false)
 		cluster.RegisterStoreWatcher(share.CLUSConfigCustomRuleStore, customRuleConfigUpdate, false)
 	}()
+	return nil
 }
 
 func closeCluster() {

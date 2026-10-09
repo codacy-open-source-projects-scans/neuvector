@@ -44,7 +44,6 @@ const (
 
 const (
 	PIPE_TC   = "tc"
-	PIPE_OVS  = "ovs"
 	PIPE_NOTC = "no_tc"
 	PIPE_CLM  = "clm"
 )
@@ -115,7 +114,10 @@ func waitLinkReady(port string) (netlink.Link, uint) {
 
 func createNVPorts(jumboframe bool) {
 	// Create port with large ifindex so it won't be in the same range of container ports
-	link, _ := netlink.LinkByName(nvVbrPortName)
+	link, err := netlink.LinkByName(nvVbrPortName)
+	if err != nil {
+		log.WithFields(log.Fields{"error": err}).Debug("NV bridge port not found, will create")
+	}
 	if link == nil {
 		veth := &linkVeth{
 			LinkAttrs: netlink.LinkAttrs{
@@ -233,8 +235,7 @@ func pullContainerPort(
 		}
 	}
 	// Temp. set MAC address
-	tmp, _ := net.ParseMAC("00:01:02:03:04:05")
-	if err = netlink.LinkSetHardwareAddr(link, tmp); err != nil {
+	if err = netlink.LinkSetHardwareAddr(link, net.HardwareAddr{0x00, 0x01, 0x02, 0x03, 0x04, 0x05}); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Error in changing MAC")
 		return 0, err
 	}
@@ -471,7 +472,11 @@ func readLinkIPRoute() ([]netlink.Link, map[netlink.Link][]netlink.Addr, []netli
 	}
 
 	// Read all neigh
-	neighs, _ := getPermanentNeighList(links)
+	// getPermanentNeighList always returns nil error (handles errors internally with continue)
+	neighs, err := getPermanentNeighList(links)
+	if err != nil {
+		log.WithFields(log.Fields{"error": err}).Warn("Error in reading permanent neighs")
+	}
 	for _, neigh := range neighs {
 		log.WithFields(log.Fields{"neigh": neigh}).Debug("")
 	}
@@ -999,7 +1004,9 @@ func InspectContainerPorts(pid int, existPairs []*InterceptPair) ([]*InterceptPa
 	}
 
 	var intcpPairs []*InterceptPair
-	intcpPairs, _ = readAllContainerPorts(pid, existPairMap)
+	if intcpPairs, err = readAllContainerPorts(pid, existPairMap); err != nil {
+		log.WithFields(log.Fields{"error": err}).Warn("Failed to read container ports")
+	}
 
 	// Switch back to original NS
 	log.WithFields(log.Fields{"ns": curNs}).Debug("Restore ns")
@@ -1770,8 +1777,6 @@ func GetPortPairDebug(pair *InterceptPair) *share.CLUSWorkloadInterceptPort {
 
 func Open(driver string, cnet_type *string, pid int, jumboframe bool) (string, string, error) {
 	switch driver {
-	case PIPE_OVS:
-		piper = &ovsPipe
 	case PIPE_TC:
 		piper = &tcPipe
 	case PIPE_NOTC:

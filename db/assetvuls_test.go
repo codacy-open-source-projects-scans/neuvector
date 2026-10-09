@@ -96,9 +96,10 @@ func TestGetImageAssetSessionIncludesOSScanStatus(t *testing.T) {
 	err = PopulateAssetVul(generateImageDbAssetVul(imageID))
 	assert.NoError(t, err)
 
-	queryToken := "abc123def456"
+	queryID, err := GenQueryID()
+	assert.NoError(t, err)
 	queryFilter := &AssetQueryFilter{
-		QueryToken: queryToken,
+		QueryID:    queryID,
 		QueryStart: 0,
 		QueryCount: -1,
 		Filters: &api.AssetQueryFilterViewModel{
@@ -118,7 +119,7 @@ func TestGetImageAssetSessionIncludesOSScanStatus(t *testing.T) {
 	assert.NoError(t, err)
 
 	_, err = PopulateQueryStat(&QueryStat{
-		Token:        queryToken,
+		QueryID:      queryID,
 		CreationTime: 1,
 		LoginType:    0,
 		LoginName:    "test",
@@ -128,8 +129,8 @@ func TestGetImageAssetSessionIncludesOSScanStatus(t *testing.T) {
 	})
 	assert.NoError(t, err)
 	defer func() {
-		if err := DeleteQuerySessionByToken(queryToken); err != nil {
-			t.Logf("DeleteQuerySessionByToken returns %v", err)
+		if err := DeleteQuerySessionByQueryID(queryID); err != nil {
+			t.Logf("DeleteQuerySessionByQueryID returns %v", err)
 		}
 	}()
 
@@ -141,6 +142,10 @@ func TestGetImageAssetSessionIncludesOSScanStatus(t *testing.T) {
 	assert.Equal(t, 1, len(assets))
 
 	assert.Equal(t, "OSScanStatusSupported", assets[0].OSScanStatus)
+
+	assert.Equal(t, "1.21", assets[0].CVEDBVersion)
+
+	assert.Equal(t, "1769111241", assets[0].CVEDBCreateTime)
 }
 
 func generateHostDbAssetVul(assetid string, containerCount int) *DbAssetVul {
@@ -202,6 +207,8 @@ func generateImageDbAssetVul(assetid string) *DbAssetVul {
 		CVE_critical:      2,
 		CVE_high:          5,
 		CVE_medium:        3,
+		CVEDB_version:     "1.21",
+		CVEDB_createtime:  "1769111241",
 		I_repository_name: "registry-1",
 		I_repository_url:  "https://registry.example.com/",
 		I_base_os:         "debian",

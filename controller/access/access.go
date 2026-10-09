@@ -907,7 +907,6 @@ func CompileUriPermitsMapping() {
 				"v1/file/config",
 				"v1/system/config",
 				"v2/system/config",
-				"v1/system/license",
 				"v1/system/summary",
 				"v1/internal/system",
 				"v1/system/score/metrics",
@@ -1017,10 +1016,10 @@ func CompileUriPermitsMapping() {
 				"v1/password_profile",
 			},
 			CONST_API_SYSTEM_CONFIG: {
-				"v1/system/license/update",
 				"v1/system/config/webhook",
 				"v1/system/config/remote_repository",
 				"v1/system/score/metrics",
+				"v1/system/score/exposure",
 			},
 			CONST_API_IBMSA: {
 				"v1/partner/ibm_sa/*/setup/*",
@@ -1175,7 +1174,6 @@ func CompileUriPermitsMapping() {
 				"v1/password_profile/*",
 			},
 			CONST_API_SYSTEM_CONFIG: {
-				"v1/system/license",
 				"v1/system/config/webhook/*",
 				"v1/system/config/remote_repository/*",
 			},

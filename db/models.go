@@ -2,13 +2,16 @@ package db
 
 import (
 	"bytes"
+	"crypto/sha512"
 	"database/sql"
 	"encoding/gob"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,7 +77,7 @@ type DbCVESource struct {
 }
 
 type VulQueryFilter struct {
-	QueryToken                     string
+	QueryID                        string
 	QueryStart                     int
 	QueryCount                     int
 	Debug                          int
@@ -88,7 +91,7 @@ type VulQueryFilter struct {
 }
 
 type AssetQueryFilter struct {
-	QueryToken string
+	QueryID    string
 	QueryStart int
 	QueryCount int
 	Debug      int
@@ -107,13 +110,15 @@ type DbAssetVul struct {
 	W_service_group  string
 	W_workload_image string
 
-	CVE_critical int
-	CVE_high     int
-	CVE_medium   int
-	CVE_low      int
-	Vuls         []*share.ScanVulnerability
-	Modules      []*share.ScanModule
-	Scanned_at   string
+	CVE_critical     int
+	CVE_high         int
+	CVE_medium       int
+	CVE_low          int
+	Vuls             []*share.ScanVulnerability
+	Modules          []*share.ScanModule
+	Scanned_at       string
+	CVEDB_version    string
+	CVEDB_createtime string
 
 	N_os         string
 	N_kernel     string
@@ -181,6 +186,7 @@ const (
 const (
 	dbFile_Vulassets      string = "/tmp/vulasset.db"
 	dbFile_VulassetsLocal string = "./vulasset.db"
+	dbFile_CVE            string = "/tmp/cve.db"
 	dbFile_Folder         string = "/tmp"
 	// https://github.com/mattn/go-sqlite3?tab=readme-ov-file#faq
 	memoryDbFile string = "file::memory:?cache=shared"
@@ -189,31 +195,47 @@ const (
 	Table_assetvuls  = "assetvuls"
 	Table_querystats = "querystats"
 	Table_bench      = "bench"
+	Table_cvedb      = "cvedb"
 )
 
 var dbHandle *sql.DB = nil
+var dbCVEHandle *sql.DB = nil
 var memoryDbHandle *sql.DB = nil
+var regexTempTableName *regexp.Regexp
 
 var funcGetCveRecord func(string, string, string) *DbVulAsset
 var funcGetCVEList func([]byte, string) []string
 var funcFillVulPackages func(*sync.Mutex, map[string]map[string]utils.Set, []byte, string, *[]string, map[string]*int) error
 var funcGetImageCVECount func(string, string) (int, int, int, error) // funcGetImageCVECount
-var funcGetCveDbRecordCount func() int
 var memdbMutex sync.RWMutex
 
+// deleteDBAndWAL removes a SQLite database file and its WAL auxiliary files (-shm, -wal).
+// Non-existence is silently ignored; other errors are logged at debug level.
+func deleteDBAndWAL(path string) {
+	for _, suffix := range []string{"", "-shm", "-wal"} {
+		f := path + suffix
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			log.WithFields(log.Fields{"err": err, "file": f}).Debug("delete existing db file")
+		}
+	}
+}
+
 func CreateVulAssetDb(useLocal bool) error {
+	var err error
+	regexTempTableName, err = regexp.Compile("^tmp_session_[0-9a-fA-F]{128}$")
+	if err != nil {
+		return fmt.Errorf("failed to compile temp table name regex: %w", err)
+	}
+
 	dbFile := dbFile_Vulassets
 	if useLocal {
 		dbFile = dbFile_VulassetsLocal
 	}
 
-	// delete existing file
-	if _, err := os.Stat(dbFile); err == nil {
-		err := os.Remove(dbFile)
-		if err != nil {
-			log.WithFields(log.Fields{"err": err, "file": dbFile}).Debug("delete existing db file")
-		}
-	}
+	// Delete the database file and its SQLite WAL auxiliary files so that stale
+	// WAL data (e.g. from a previous run or from source control) cannot corrupt
+	// the freshly created database.
+	deleteDBAndWAL(dbFile)
 
 	// create file based db
 	db, err := sql.Open("sqlite3", dbFile)
@@ -270,6 +292,76 @@ func CreateVulAssetDb(useLocal bool) error {
 	return nil
 }
 
+// CreateCVEDb creates (or recreates) the dedicated cve.db SQLite database that holds
+// CVEDB data separately from vulasset.db to avoid write-lock contention.
+func CreateCVEDb() error {
+	dbFile := dbFile_CVE
+
+	// Delete the database file and its SQLite WAL auxiliary files so that stale
+	// WAL data (e.g. from a previous run or from source control) cannot corrupt
+	// the freshly created database.
+	deleteDBAndWAL(dbFile)
+
+	db, err := sql.Open("sqlite3", dbFile)
+	if err != nil {
+		return err
+	}
+	dbCVEHandle = db
+
+	statements := []string{
+		// cvedb: one row per CVE lookup key (e.g. "ubuntu:CVE-2021-1234", "apps:foo", "CVE-2021-1234").
+		// The prefix column holds the baseOS portion of the key and is indexed so that all entries
+		// for one baseOS can be fetched with a single equality query.
+		`CREATE TABLE IF NOT EXISTS cvedb (
+			name               TEXT NOT NULL PRIMARY KEY,
+			prefix             TEXT NOT NULL DEFAULT '',
+			score              REAL DEFAULT 0,
+			score_v3           REAL DEFAULT 0,
+			severity           TEXT,
+			description        TEXT,
+			link               TEXT,
+			vectors            TEXT,
+			vectors_v3         TEXT,
+			published_date     TEXT,
+			last_modified_date TEXT,
+			package_name       TEXT,
+			fixed_version      TEXT,
+			feed_rating        TEXT,
+			in_base            INTEGER DEFAULT 0,
+			db_key             TEXT,
+			cpes               TEXT,
+			cves               TEXT
+		)`,
+		"CREATE INDEX IF NOT EXISTS cvedb_prefix_idx ON cvedb (prefix)",
+		"CREATE INDEX IF NOT EXISTS cvedb_db_key_idx ON cvedb (db_key)",
+		// cvedb_meta: single row with current CVEDB version and create time.
+		`CREATE TABLE IF NOT EXISTS cvedb_meta (
+			id              INTEGER NOT NULL PRIMARY KEY,
+			db_version      TEXT,
+			db_create_time  TEXT
+		)`,
+	}
+
+	for _, oneSql := range statements {
+		if _, err = dbCVEHandle.Exec(oneSql); err != nil {
+			log.WithFields(log.Fields{"err": err, "oneSql": oneSql}).Debug("exec sql")
+			return err
+		}
+	}
+
+	// Enable WAL mode so readers see the last-committed snapshot during a write transaction.
+	// SQLite never returns a SQL error when WAL is unsupported (e.g. NFS); it silently falls
+	// back to DELETE mode. We scan the returned mode string to detect that silent fallback.
+	var journalMode string
+	if err = dbCVEHandle.QueryRow("PRAGMA journal_mode=WAL").Scan(&journalMode); err != nil {
+		log.WithFields(log.Fields{"err": err}).Warn("cvedb: failed to set WAL mode on cve.db")
+	} else if journalMode != "wal" {
+		log.WithFields(log.Fields{"mode": journalMode}).Warn("cvedb: WAL mode not active on cve.db; concurrent reads during writes will block")
+	}
+
+	return nil
+}
+
 func reopenMemoryDb() error {
 	if memoryDbHandle != nil {
 		memoryDbHandle.Close()
@@ -318,10 +410,6 @@ func SetGetCVECountFunc(getImageCVECount func(string, string) (int, int, int, er
 	funcGetImageCVECount = getImageCVECount
 }
 
-func SetGetCveDbRecordCountFunc(getCveDbRecordCount func() int) {
-	funcGetCveDbRecordCount = getCveDbRecordCount
-}
-
 func getVulassetSchema() []string {
 	schema := []string{"id INTEGER NOT NULL PRIMARY KEY", "name TEXT", "severity TEXT", "description TEXT", "packages TEXT",
 		"link TEXT", "score INTEGER", "vectors TEXT", "score_v3 INTEGER", "vectors_v3 TEXT",
@@ -342,7 +430,8 @@ func getAssetvulSchema(uniqueAssetId bool) []string {
 
 	schema := []string{"id INTEGER NOT NULL PRIMARY KEY", "type TEXT", assetIdColumn, "name TEXT",
 		"w_domain TEXT", "w_applications TEXT", "policy_mode TEXT", "w_service_group TEXT", "w_image TEXT",
-		"cve_critical INTEGER", "cve_high INTEGER", "cve_medium INTEGER", "cve_low INTEGER", "cve_count INTEGER", "scanned_at TEXT",
+		"cve_critical INTEGER", "cve_high INTEGER", "cve_medium INTEGER", "cve_low INTEGER", "cve_count INTEGER",
+		"cvedb_version TEXT DEFAULT ''", "cvedb_createtime TEXT DEFAULT ''", "scanned_at TEXT",
 		"n_os TEXT", "n_kernel TEXT", "n_cpus INTEGER", "n_memory INTEGER",
 		"n_containers INTEGER", "p_version TEXT", "p_base_os TEXT", "idns TEXT", "vulsb BLOB", "modulesb BLOB",
 		"I_created_at TEXT", "I_scanned_at TEXT", "I_digest TEXT", "I_base_os TEXT", "I_os_scan_status TEXT DEFAULT ''",
@@ -351,8 +440,12 @@ func getAssetvulSchema(uniqueAssetId bool) []string {
 	return schema
 }
 
-func formatSessionTempTableName(queryToken string) string {
-	return fmt.Sprintf("tmp_session_%s", queryToken)
+func formatSessionTempTableName(queryID string) (string, error) {
+	if err := vaildateQueryID(queryID); err != nil {
+		return "", err
+	}
+	b := sha512.Sum512([]byte(queryID))
+	return fmt.Sprintf("tmp_session_%s", hex.EncodeToString(b[:])), nil
 }
 
 func getQueryParamInteger(r *http.Request, name string, defaultValue int) int {
@@ -494,7 +587,10 @@ func getBytesColumns(assetid string, columnFlags int) (map[int][]byte, error) {
 		paramMaps = append(paramMaps, COL_MODULES)
 	}
 
-	statement, args, _ := dialect.From(Table_assetvuls).Select(columns...).Where(goqu.Ex{"assetid": assetid}).Prepared(true).ToSQL()
+	statement, args, err := dialect.From(Table_assetvuls).Select(columns...).Where(goqu.Ex{"assetid": assetid}).Prepared(true).ToSQL()
+	if err != nil {
+		return results, fmt.Errorf("failed to build asset vuls query: %w", err)
+	}
 	rows, err := db.Query(statement, args...)
 	if err != nil {
 		return results, err

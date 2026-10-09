@@ -17,6 +17,7 @@ import (
 	"github.com/neuvector/neuvector/controller/api"
 	"github.com/neuvector/neuvector/controller/rpc"
 	"github.com/neuvector/neuvector/controller/scan"
+	nvdb "github.com/neuvector/neuvector/db"
 	"github.com/neuvector/neuvector/share"
 	scanUtils "github.com/neuvector/neuvector/share/scan"
 )
@@ -139,8 +140,9 @@ func (r *repoScanTask) Run(arg interface{}) (interface{}, *JobError) {
 			"errMsg":   rsr.errMsg,
 		}).Error("RPC request fail")
 	} else if result.Error != share.ScanErrorCode_ScanErrNone {
-		// Include the error code in Detail to enable ShouldRetry logic
-		scanErr = NewJobError(api.RESTErrFailRepoScan, err, result.Error)
+		// Include the error code in Detail to enable ShouldRetry logic.
+		// Use the human-readable string as Err so it surfaces in the API response body.
+		scanErr = NewJobError(api.RESTErrFailRepoScan, errors.New(scanUtils.ScanErrorToStr(result.Error)), result.Error)
 		log.WithFields(log.Fields{
 			"registry":   req.Registry,
 			"image":      getImageName(req),
@@ -169,7 +171,7 @@ func (r *repoScanTask) Run(arg interface{}) (interface{}, *JobError) {
 			}
 		}
 
-		rpt := scanUtils.ScanRepoResult2REST(result, cpf.filter)
+		rpt := scanUtils.ScanRepoResult2REST(nvdb.GlobalCVECache(), result, cpf.filter)
 		rpt.Checks = filterComplianceChecks(rpt.Checks, cpf)
 
 		vpf := cacher.GetVulnerabilityProfileInterface(share.DefaultVulnerabilityProfileName)
@@ -193,15 +195,13 @@ func handlerScanRepositoryReq(w http.ResponseWriter, r *http.Request, ps httprou
 		return
 	}
 
-	if !licenseAllowScan() {
-		restRespError(w, http.StatusBadRequest, api.RESTErrLicenseFail)
-		return
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
 	}
 
-	body, _ := io.ReadAll(r.Body)
-
 	var data api.RESTScanRepoReqData
-	err := json.Unmarshal(body, &data)
+	err = json.Unmarshal(body, &data)
 	if err != nil || data.Request == nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
 		restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)
@@ -295,15 +295,13 @@ func handlerScanRepositorySubmit(w http.ResponseWriter, r *http.Request, ps http
 		return
 	}
 
-	if !licenseAllowScan() {
-		restRespError(w, http.StatusBadRequest, api.RESTErrLicenseFail)
-		return
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
 	}
 
-	body, _ := io.ReadAll(r.Body)
-
 	var data api.RESTScanRepoSubmitData
-	err := json.Unmarshal(body, &data)
+	err = json.Unmarshal(body, &data)
 	if err != nil || data.Result == nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
 		restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -133,8 +134,16 @@ func getLocalInfo(selfID string, pid2ID map[int]string) error {
 	Ctrler.HostName = Host.Name
 	Ctrler.Ver = Version
 
-	ctrlEnv.cgroupMemory, _ = global.SYS.GetContainerCgroupPath(0, "memory")
-	ctrlEnv.cgroupCPUAcct, _ = global.SYS.GetContainerCgroupPath(0, "cpuacct")
+	ctrlEnv.cgroupMemory, err = global.SYS.GetContainerCgroupPath(0, "memory")
+	if err != nil {
+		// Suppress error: cgroup path may not be available outside containers
+		log.WithError(err).Debug("failed to get memory cgroup path")
+	}
+	ctrlEnv.cgroupCPUAcct, err = global.SYS.GetContainerCgroupPath(0, "cpuacct")
+	if err != nil {
+		// Suppress error: cgroup path may not be available outside containers
+		log.WithError(err).Debug("failed to get cpuacct cgroup path")
+	}
 	return nil
 }
 
@@ -193,9 +202,21 @@ type localSystemInfo struct {
 var gInfo localSystemInfo
 
 func updateStats() {
-	cpuSystem, _ := global.SYS.GetHostCPUUsage()
-	mem, _ := global.SYS.GetContainerMemoryUsage(ctrlEnv.cgroupMemory)
-	cpu, _ := global.SYS.GetContainerCPUUsage(ctrlEnv.cgroupCPUAcct)
+	cpuSystem, err := global.SYS.GetHostCPUUsage()
+	if err != nil {
+		// Suppress error: called periodically, can exceed 60/min
+		log.WithError(err).Debug("failed to get host CPU usage")
+	}
+	mem, err := global.SYS.GetContainerMemoryUsage(ctrlEnv.cgroupMemory)
+	if err != nil {
+		// Suppress error: called periodically, can exceed 60/min
+		log.WithError(err).Debug("failed to get container memory usage")
+	}
+	cpu, err := global.SYS.GetContainerCPUUsage(ctrlEnv.cgroupCPUAcct)
+	if err != nil {
+		// Suppress error: called periodically, can exceed 60/min
+		log.WithError(err).Debug("failed to get container CPU usage")
+	}
 
 	gInfo.mutex.Lock()
 	system.UpdateStats(&gInfo.stats, mem, cpu, cpuSystem)
@@ -546,16 +567,17 @@ func main() {
 	var internalCertControllerCancel context.CancelFunc
 	var ctx context.Context
 
-	if os.Getenv("AUTO_INTERNAL_CERT") != "" {
-
-		log.Info("start initializing k8s internal secret controller and wait for internal secret creation if it's not created")
-
+	// Healthz server handles internal cert migration (enabled by default) and readiness checks (always enabled in k8s).
+	if platform == share.PlatformKubernetes {
 		go func() {
 			if err := healthz.StartHealthzServer(); err != nil {
 				log.WithError(err).Warn("failed to start healthz server")
 			}
 		}()
+	}
 
+	if os.Getenv("AUTO_INTERNAL_CERT") != "" {
+		log.Info("start initializing k8s internal secret controller and wait for internal secret creation if it's not created")
 		ctx, internalCertControllerCancel = context.WithCancel(context.Background())
 		defer internalCertControllerCancel()
 		// Initialize secrets.  Most of services are not running at this moment, so skip their reload functions.
@@ -592,6 +614,8 @@ func main() {
 				os.Exit(-2)
 			}
 		}
+	} else {
+		resource.AdjustRequiredRBAC(false)
 	}
 
 	err = cluster.ReloadInternalCert()
@@ -607,6 +631,11 @@ func main() {
 
 	if err := db.CreateVulAssetDb(false); err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("CreateVulAssetDb")
+		os.Exit(-2)
+	}
+	if err := db.CreateCVEDb(); err != nil {
+		log.WithFields(log.Fields{"error": err}).Error("CreateCVEDb")
+		os.Exit(-2)
 	}
 
 	keyRotationDuration := time.Duration(time.Hour * 24 * 30 * 3)
@@ -751,6 +780,33 @@ func main() {
 			log.WithFields(log.Fields{"err": err}).Error("Failed to read store passphrases")
 			os.Exit(-2)
 		}
+	} else {
+		if keyFile := os.Getenv("STORE_PASSPHRASE_FILE"); keyFile != "" {
+			passphrase, err := os.ReadFile(keyFile)
+			if err != nil {
+				log.WithFields(log.Fields{"err": err, "file": keyFile}).Error("STORE_PASSPHRASE_FILE: failed to read key file")
+				os.Exit(-2)
+			}
+			passphrase = bytes.TrimSpace(passphrase)
+			if len(passphrase) < common.DekSeedLength {
+				log.WithFields(log.Fields{
+					"file":     keyFile,
+					"got":      len(passphrase),
+					"required": common.DekSeedLength,
+				}).Errorf("STORE_PASSPHRASE_FILE: passphrase too short (%d bytes); must be at least %d bytes. Generate with: openssl rand -base64 48 > <path>",
+					len(passphrase), common.DekSeedLength)
+				os.Exit(-2)
+			}
+			encKeys := common.EncKeys{"1": passphrase}
+			if err := common.InitAesGcmKey(encKeys, "1"); err != nil {
+				log.WithFields(log.Fields{"err": err, "file": keyFile}).Error("STORE_PASSPHRASE_FILE: failed to initialize encryption key")
+				os.Exit(-2)
+			}
+			log.WithFields(log.Fields{"file": keyFile}).Info("store passphrase loaded from STORE_PASSPHRASE_FILE")
+		} else {
+			log.Warn("STORE_PASSPHRASE_FILE not set; DEK-backed state encryption unavailable on non-Kubernetes platform")
+			os.Exit(-2)
+		}
 	}
 
 	emptyKvFound := false
@@ -855,7 +911,10 @@ func main() {
 	var nvAppFullVersion string  // in the format  {major}.{minor}.{patch}[-s{#}]
 	var nvSemanticVersion string // in the format v{major}.{minor}.{patch}
 	{
-		if value, _ := cluster.Get(share.CLUSCtrlVerKey); value != nil {
+		value, err := cluster.Get(share.CLUSCtrlVerKey)
+		if err != nil {
+			log.WithError(err).Warn("failed to get controller version key")
+		} else if value != nil {
 			// ver.CtrlVersion   : in the format v{major}.{minor}.{patch}[-s{#}] or interim/master.xxxx
 			// nvAppFullVersion  : in the format  {major}.{minor}.{patch}[-s{#}]
 			// nvSemanticVersion : in the format v{major}.{minor}.{patch}
@@ -895,7 +954,9 @@ func main() {
 		*teleNeuvectorEP = ""
 	}
 
-	if value, _ := cluster.Get(share.CLUSCtrlVerKey); value != nil {
+	if value, err := cluster.Get(share.CLUSCtrlVerKey); err != nil {
+		log.WithError(err).Warn("failed to get controller version key")
+	} else if value != nil {
 		var ver share.CLUSCtrlVersion
 		if err := json.Unmarshal(value, &ver); err != nil {
 			log.WithFields(log.Fields{"error": err}).Error("Unmarshal")
@@ -1074,7 +1135,9 @@ func main() {
 	}
 
 	if !*noDefAdmin {
-		if user, _, _ := clusHelper.GetUserRev(common.DefaultAdminUser, access.NewFedAdminAccessControl()); user != nil {
+		if user, _, err := clusHelper.GetUserRev(common.DefaultAdminUser, access.NewFedAdminAccessControl()); err != nil {
+			log.WithError(err).Warn("failed to get default admin user rev")
+		} else if user != nil {
 			if user.PasswordHash == "" {
 				log.Error("invalid password hash for default admin user")
 				os.Exit(-2)

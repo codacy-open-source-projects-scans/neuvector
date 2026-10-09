@@ -1,11 +1,11 @@
 package utils
 
 import (
+	"net"
 	"testing"
 
-	"net"
-
 	"github.com/neuvector/neuvector/share"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNormalizeForURL(t *testing.T) {
@@ -78,8 +78,10 @@ func TestSubnetContains(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		_, n1, _ := net.ParseCIDR(c.n1)
-		_, n2, _ := net.ParseCIDR(c.n2)
+		_, n1, err := net.ParseCIDR(c.n1)
+		require.NoError(t, err)
+		_, n2, err := net.ParseCIDR(c.n2)
+		require.NoError(t, err)
 		contain, compare := SubnetContains(n1, n2)
 		if contain != c.contain || compare != c.compare {
 			t.Errorf("Error: n1=%v n2=%v\n", n1.String(), n2.String())
@@ -126,7 +128,8 @@ func TestSubnetLoose(t *testing.T) {
 		{"1.2.3.4/32", share.CLUSIPAddrScopeGlobal, "1.2.3.0/24"},
 	}
 	for _, c := range cases {
-		_, ipnet, _ := net.ParseCIDR(c.input)
+		_, ipnet, err := net.ParseCIDR(c.input)
+		require.NoError(t, err)
 		parsed := IPNet2SubnetLoose(ipnet, c.scope)
 		if parsed.String() != c.output {
 			t.Errorf("Error: input=%s scope=%s", c.input, c.scope)
@@ -201,30 +204,6 @@ func TestUserTokenEncrypt(t *testing.T) {
 	decrypt, err := DecryptUserToken(encrypt, []byte(key))
 	if decrypt != token || err != nil {
 		t.Errorf("Token encrypt error: token=%v encrypt=%v decrypt=%v err=%v\n", token, encrypt, decrypt, err)
-	}
-}
-
-func TestPasswordEncrypt(t *testing.T) {
-	password := "123456"
-	encrypt := EncryptPassword(password)
-	decrypt := DecryptPassword(encrypt)
-	if decrypt != password {
-		t.Errorf("Password encrypt error: password=%v decrypt=%v\n", password, decrypt)
-	}
-
-	if EncryptPassword("") != "" {
-		t.Errorf("Empty password should be encrypted as emtpy string\n")
-	}
-
-	e1 := EncryptPassword(password)
-	e2 := EncryptPassword(password)
-	if e1 == e2 {
-		t.Errorf("Encrypt same string twice gives same output\n")
-	}
-
-	decrypt = DecryptPassword("1234567890")
-	if decrypt != "" {
-		t.Errorf("Decrypt invalid string should give empty output\n")
 	}
 }
 

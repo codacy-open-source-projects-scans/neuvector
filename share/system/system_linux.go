@@ -42,6 +42,7 @@ const (
 	NSActGet   string = "get"
 	NSActRun   string = "run"
 	NSActExist string = "exist"
+	NSActExec  string = "exec"
 )
 
 const nanoSecondsPerSecond = 1e9
@@ -591,7 +592,10 @@ func (s *SystemTools) GetProcessName(pid int) (string, int, error) {
 				}
 			}
 		} else if strings.HasPrefix(line, "PPid:\t") {
-			ppid, _ = strconv.Atoi(line[6:])
+			ppid, err = strconv.Atoi(line[6:])
+			if err != nil {
+				log.WithError(err).Debug("failed to parse process PPid")
+			}
 			return name, ppid, nil
 		}
 	}
@@ -625,7 +629,10 @@ func (s *SystemTools) ParseContainerFilePath(path string) (int, string) {
 		return 0, ""
 	}
 	str := path[a+len(s.procDir) : b]
-	pid, _ := strconv.Atoi(str)
+	pid, err := strconv.Atoi(str)
+	if err != nil {
+		log.WithError(err).Debug("failed to parse container file path pid")
+	}
 	return pid, path[b+5:]
 }
 

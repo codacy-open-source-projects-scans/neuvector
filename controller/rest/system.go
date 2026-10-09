@@ -104,7 +104,10 @@ func handlerSystemUsage(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 		return
 	}
 
-	keys, _ := cluster.GetStoreKeys(share.CLUSCtrlUsageReportStore)
+	keys, err := cluster.GetStoreKeys(share.CLUSCtrlUsageReportStore)
+	if err != nil {
+		log.WithError(err).Warn("failed to get usage report store keys")
+	}
 	all := make([]*api.RESTSystemUsageReport, 0, len(keys))
 	for _, key := range keys {
 		if v, err := cluster.Get(key); err == nil {
@@ -128,25 +131,15 @@ func handlerSystemUsage(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 		}
 
 		var nvUpgradeInfo share.CLUSCheckUpgradeInfo
-		if value, _ := cluster.Get(share.CLUSTelemetryStore + "controller"); value != nil {
+		value, err := cluster.Get(share.CLUSTelemetryStore + "controller")
+		if err != nil {
+			log.WithError(err).Warn("failed to get telemetry data from cluster")
+		}
+		if value != nil {
 			if err := json.Unmarshal(value, &nvUpgradeInfo); err != nil {
 				log.WithFields(log.Fields{"error": err}).Error("Unmarshal")
 				restRespError(w, http.StatusInternalServerError, api.RESTErrFailReadCluster)
 				return
-			}
-			if nvUpgradeInfo.MinUpgradeVersion.Version != "" {
-				resp.TelemetryStatus.MinUpgradeVersion = api.RESTUpgradeVersionInfo{
-					Version:     nvUpgradeInfo.MinUpgradeVersion.Version,
-					ReleaseDate: nvUpgradeInfo.MinUpgradeVersion.ReleaseDate,
-					Tag:         nvUpgradeInfo.MinUpgradeVersion.Tag,
-				}
-			}
-			if nvUpgradeInfo.MaxUpgradeVersion.Version != "" {
-				resp.TelemetryStatus.MaxUpgradeVersion = api.RESTUpgradeVersionInfo{
-					Version:     nvUpgradeInfo.MaxUpgradeVersion.Version,
-					ReleaseDate: nvUpgradeInfo.MaxUpgradeVersion.ReleaseDate,
-					Tag:         nvUpgradeInfo.MaxUpgradeVersion.Tag,
-				}
 			}
 			if !nvUpgradeInfo.LastUploadTime.IsZero() {
 				resp.TelemetryStatus.LastTeleUploadTime = api.RESTTimeString(nvUpgradeInfo.LastUploadTime)
@@ -171,11 +164,20 @@ func handlerDebugSystemStats(w http.ResponseWriter, r *http.Request, ps httprout
 	}
 
 	store := share.CLUSExpiredTokenStore
-	expiredTokenKeys, _ := cluster.GetStoreKeys(store)
+	expiredTokenKeys, err := cluster.GetStoreKeys(store)
+	if err != nil {
+		log.WithError(err).Warn("failed to get expired token keys")
+	}
 	store = share.CLUSScanStateStore
-	scanStateKeys, _ := cluster.GetStoreKeys(store)
+	scanStateKeys, err := cluster.GetStoreKeys(store)
+	if err != nil {
+		log.WithError(err).Warn("failed to get scan state keys")
+	}
 	store = share.CLUSScanDataStore
-	scanDataKeys, _ := cluster.GetStoreKeys(store)
+	scanDataKeys, err := cluster.GetStoreKeys(store)
+	if err != nil {
+		log.WithError(err).Warn("failed to get scan data keys")
+	}
 
 	resp := api.RESTSystemStatsData{
 		Stats: &api.RESTSystemStats{
@@ -214,9 +216,7 @@ func handlerSystemSummary(w http.ResponseWriter, r *http.Request, ps httprouter.
 		summary.CompoVersions = cacher.GetComponentVersions(acc)
 	}
 	summary.Workloads, summary.RunningWorkloads, summary.RunningPods = cacher.GetWorkloadCount(accSysConfig)
-	sdb := scanUtils.GetScannerDB()
-	summary.CVEDBVersion = sdb.CVEDBVersion
-	summary.CVEDBCreateTime = sdb.CVEDBCreateTime
+	summary.CVEDBVersion, summary.CVEDBCreateTime = scanUtils.GetCVEDBMeta()
 	resp := api.RESTSystemSummaryData{Summary: summary}
 
 	restRespSuccess(w, r, &resp, acc, login, nil, "Get system summary")
@@ -407,6 +407,48 @@ func handlerGetSystemScoreMetrics(w http.ResponseWriter, r *http.Request, ps htt
 	restRespSuccess(w, r, resp, acc, login, nil, "Get system score metrics data")
 }
 
+func handlerSendExposureReport(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug("")
+	defer r.Body.Close()
+
+	// Read access so the report contains only workloads the caller can already see.
+	acc, login := getAccessControl(w, r, access.AccessOPRead)
+	if acc == nil {
+		return
+	}
+
+	domain, err := exposureDomainFilter(restParseQuery(r))
+	if err != nil {
+		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, err.Error())
+		return
+	}
+
+	if err := cacher.SendExposureReport(acc, acc, domain); err != nil {
+		restRespErrorMessage(w, http.StatusNotFound, api.RESTErrObjectNotFound, err.Error())
+		return
+	}
+	restRespSuccess(w, r, nil, acc, login, nil, "Send exposure report to syslog")
+}
+
+func exposureDomainFilter(query *restQuery) (string, error) {
+	if query == nil {
+		return "", nil
+	}
+	var domain string
+	var found bool
+	for _, f := range query.filters {
+		if f.tag != api.FilterByDomain {
+			continue
+		}
+		if found || f.op != api.OPeq {
+			return "", fmt.Errorf("invalid f_domain filter")
+		}
+		domain = f.value
+		found = true
+	}
+	return domain, nil
+}
+
 func handlerPredictSystemScore(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	log.WithFields(log.Fields{"URL": r.URL.String()}).Debug("")
 	defer r.Body.Close()
@@ -416,10 +458,13 @@ func handlerPredictSystemScore(w http.ResponseWriter, r *http.Request, ps httpro
 		return
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
 
 	var data api.RESTPredictScoreData
-	err := json.Unmarshal(body, &data)
+	err = json.Unmarshal(body, &data)
 	if err != nil || data.Metrics == nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
 		restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)
@@ -475,6 +520,8 @@ func handlerSystemGetConfigBase(apiVer string, w http.ResponseWriter, r *http.Re
 						Url:      wh.Url,
 						Enable:   wh.Enable,
 						UseProxy: wh.UseProxy,
+						Username: wh.Username,
+						Password: wh.Password,
 						Type:     wh.Type,
 						CfgType:  common.TCfgTypeToApi(wh.CfgType),
 					}
@@ -643,10 +690,13 @@ func handlerSystemRequest(w http.ResponseWriter, r *http.Request, ps httprouter.
 
 	// Authz is done when action is taken, setting service policies.
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
 
 	var req api.RESTSystemRequestData
-	err := json.Unmarshal(body, &req)
+	err = json.Unmarshal(body, &req)
 	if err != nil || req.Request == nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
 		restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)
@@ -804,7 +854,7 @@ func validateWebhook(h *api.RESTWebhook) (int, error) {
 	return 0, nil
 }
 
-func configWebhooks(rcWebhookUrl *string, rcWebhooks *[]*api.RESTWebhook, cconfWebhooks []share.CLUSWebhook,
+func configWebhooks(rcWebhookUrl *string, rcWebhooks *[]*api.RESTWebhookConfig, cconfWebhooks []share.CLUSWebhook,
 	cfgType share.TCfgType, acc *access.AccessControl) ([]share.CLUSWebhook, int, error) {
 	// WebhookUrl is kept for backward-compatibility, it will be written into the webhook list
 	newWebhooks := make([]share.CLUSWebhook, 0)
@@ -825,6 +875,12 @@ func configWebhooks(rcWebhookUrl *string, rcWebhooks *[]*api.RESTWebhook, cconfW
 		}
 		newWebhooks = append(newWebhooks, h)
 	}
+
+	oldWebhooks := make(map[string]share.CLUSWebhook, len(cconfWebhooks))
+	for _, h := range cconfWebhooks {
+		oldWebhooks[h.Name] = h
+	}
+
 	if rcWebhooks != nil {
 		for _, h := range *rcWebhooks {
 			/* shouldn't check this, as upgraded config can be sent in the list after the user modify the setting
@@ -843,15 +899,49 @@ func configWebhooks(rcWebhookUrl *string, rcWebhooks *[]*api.RESTWebhook, cconfW
 				log.WithFields(log.Fields{"name": h.Name}).Error("Duplicate webhook name")
 				return nil, api.RESTErrInvalidName, errors.New("Duplicate webhook name")
 			}
-			if code, err := validateWebhook(h); err != nil {
+			hTemp := api.RESTWebhook{
+				Name:    h.Name,
+				Url:     h.Url,
+				Type:    h.Type,
+				CfgType: h.CfgType,
+			}
+			if code, err := validateWebhook(&hTemp); err != nil {
 				return nil, code, err
 			}
 
 			newWebhookNames.Add(h.Name)
-			newWebhooks = append(newWebhooks, share.CLUSWebhook{
-				Name: h.Name, Url: h.Url, Enable: h.Enable, UseProxy: h.UseProxy,
-				Type: h.Type, CfgType: cfgType,
-			})
+			newWebhook := share.CLUSWebhook{
+				Name:     h.Name,
+				Url:      h.Url,
+				Enable:   h.Enable,
+				UseProxy: h.UseProxy,
+				Username: h.Username,
+				Type:     h.Type,
+				CfgType:  cfgType,
+			}
+			oldWH, found := oldWebhooks[h.Name]
+			if !found {
+				var err error
+				if h.Username != "" && (h.Password == nil || *h.Password == "") {
+					err = errors.New("No password for new webhook")
+				} else if h.Username == "" && h.Password != nil && *h.Password != "" {
+					err = errors.New("No user name for new webhook")
+				}
+				if err != nil {
+					log.WithFields(log.Fields{"name": h.Name, "error": err}).Error()
+					return nil, api.RESTErrInvalidRequest, errors.New(err.Error())
+				}
+				if h.Password != nil {
+					newWebhook.Password = *h.Password
+				}
+			} else {
+				if h.Password != nil {
+					newWebhook.Password = *h.Password
+				} else {
+					newWebhook.Password = oldWH.Password
+				}
+			}
+			newWebhooks = append(newWebhooks, newWebhook)
 		}
 	}
 
@@ -897,10 +987,13 @@ func handlerSystemWebhookCreate(w http.ResponseWriter, r *http.Request, ps httpr
 		return
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
 
-	var rconf api.RESTSystemWebhookConfigData
-	err := json.Unmarshal(body, &rconf)
+	var rconf api.RESTSystemWebhookData
+	err = json.Unmarshal(body, &rconf)
 	if err != nil || rconf.Config == nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
 		restRespError(w, http.StatusBadRequest, api.RESTErrInvalidRequest)
@@ -920,6 +1013,8 @@ func handlerSystemWebhookCreate(w http.ResponseWriter, r *http.Request, ps httpr
 		Url:      rwh.Url,
 		Enable:   rwh.Enable,
 		UseProxy: rwh.UseProxy,
+		Username: rwh.Username,
+		Password: rwh.Password,
 		Type:     rwh.Type,
 		CfgType:  share.UserCreated,
 	}
@@ -928,6 +1023,18 @@ func handlerSystemWebhookCreate(w http.ResponseWriter, r *http.Request, ps httpr
 	}
 	if !acc.Authorize(&cwh, nil) {
 		restRespAccessDenied(w, login)
+		return
+	}
+
+	err = nil
+	if rwh.Username != "" && rwh.Password == "" {
+		err = errors.New("No password for new webhook")
+	} else if rwh.Username == "" && rwh.Password != "" {
+		err = errors.New("No user name for new webhook")
+	}
+	if err != nil {
+		log.WithFields(log.Fields{"name": rwh.Name, "error": err}).Error()
+		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, err.Error())
 		return
 	}
 
@@ -1026,7 +1133,10 @@ func handlerSystemWebhookConfig(w http.ResponseWriter, r *http.Request, ps httpr
 
 	name := ps.ByName("name")
 
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
 
 	var rconf api.RESTSystemWebhookConfigData
 	err = json.Unmarshal(body, &rconf)
@@ -1049,7 +1159,13 @@ func handlerSystemWebhookConfig(w http.ResponseWriter, r *http.Request, ps httpr
 		restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, "Empty webhook name or URL")
 		return
 	}
-	if code, err := validateWebhook(rwh); err != nil {
+	rwhTemp := api.RESTWebhook{
+		Name:    rwh.Name,
+		Url:     rwh.Url,
+		Type:    rwh.Type,
+		CfgType: rwh.CfgType,
+	}
+	if code, err := validateWebhook(&rwhTemp); err != nil {
 		restRespErrorMessage(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
@@ -1090,8 +1206,24 @@ func handlerSystemWebhookConfig(w http.ResponseWriter, r *http.Request, ps httpr
 					Url:      rwh.Url,
 					Enable:   rwh.Enable,
 					UseProxy: rwh.UseProxy,
+					Username: rwh.Username,
+					Password: cconf.Webhooks[i].Password,
 					Type:     rwh.Type,
 					CfgType:  wh.CfgType,
+				}
+				if rwh.Password != nil {
+					cconf.Webhooks[i].Password = *rwh.Password
+				}
+				err = nil
+				if cconf.Webhooks[i].Username != "" && cconf.Webhooks[i].Password == "" {
+					err = errors.New("No password for new webhook")
+				} else if cconf.Webhooks[i].Username == "" && cconf.Webhooks[i].Password != "" {
+					err = errors.New("No user name for new webhook")
+				}
+				if err != nil {
+					log.WithFields(log.Fields{"name": rwh.Name, "error": err}).Error()
+					restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrInvalidRequest, err.Error())
+					return
 				}
 				found = true
 				break
@@ -1564,7 +1696,11 @@ func configSystemConfig(w http.ResponseWriter, acc *access.AccessControl, login 
 				order := make([]string, 0)
 				for _, name := range *rc.AuthOrder {
 					if name != api.AuthServerLocal {
-						if cs, _, _ := clusHelper.GetServerRev(name, acc); cs == nil {
+						cs, _, err := clusHelper.GetServerRev(name, acc)
+						if err != nil {
+							log.WithError(err).Warn("failed to get server rev for auth order")
+						}
+						if cs == nil {
 							e := "Authentication server not found"
 							log.WithFields(log.Fields{"name": name}).Error(e)
 							restRespErrorMessage(w, http.StatusBadRequest, api.RESTErrObjectNotFound, e)
@@ -1931,8 +2067,11 @@ func handlerSystemConfigBase(apiVer string, w http.ResponseWriter, r *http.Reque
 	scope := share.ScopeFed
 	dummy := share.CLUSSystemConfig{CfgType: share.FederalCfg}
 	var rconf api.RESTSystemConfigConfigData
-	body, _ := io.ReadAll(r.Body)
-	err := json.Unmarshal(body, &rconf)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
+	err = json.Unmarshal(body, &rconf)
 	if err == nil && apiVer == "v2" {
 		if rconf.ConfigV2 != nil {
 			config := &api.RESTSystemConfigConfig{}
@@ -2112,7 +2251,10 @@ func handlerSessionList(w http.ResponseWriter, r *http.Request, ps httprouter.Pa
 
 	for _, f := range query.filters {
 		if f.tag == api.FilterByID && f.op == api.OPeq {
-			id, _ := strconv.ParseUint(f.value, 10, 64)
+			id, err := strconv.ParseUint(f.value, 10, 64)
+			if err != nil {
+				log.WithError(err).Warn("failed to parse filter ID value")
+			}
 			csf.ID = uint32(id)
 		}
 	}
@@ -2214,7 +2356,10 @@ func handlerSessionDelete(w http.ResponseWriter, r *http.Request, ps httprouter.
 
 	for _, f := range query.filters {
 		if f.tag == api.FilterByID && f.op == api.OPeq {
-			id, _ := strconv.ParseUint(f.value, 10, 64)
+			id, err := strconv.ParseUint(f.value, 10, 64)
+			if err != nil {
+				log.WithError(err).Warn("failed to parse filter ID value")
+			}
 			csf.ID = uint32(id)
 		}
 	}
@@ -2301,37 +2446,6 @@ func handlerMeterList(w http.ResponseWriter, r *http.Request, ps httprouter.Para
 	log.WithFields(log.Fields{"entries": len(resp.Meters)}).Debug()
 	restRespSuccess(w, r, &resp, acc, login, nil, "Get meter list")
 }
-func getNvUpgradeInfo() *api.RESTCheckUpgradeInfo {
-	var nvUpgradeInfo share.CLUSCheckUpgradeInfo
-	if value, _ := cluster.Get(share.CLUSTelemetryStore + "controller"); value != nil {
-		if err := json.Unmarshal(value, &nvUpgradeInfo); err != nil {
-			log.WithFields(log.Fields{"error": err}).Error("Unmarshal")
-			return nil
-		}
-	}
-
-	empty := share.CLUSCheckUpgradeVersion{}
-	upgradeInfo := &api.RESTCheckUpgradeInfo{}
-	if nvUpgradeInfo.MinUpgradeVersion != empty {
-		upgradeInfo.MinUpgradeVersion = &api.RESTUpgradeInfo{
-			Version:     nvUpgradeInfo.MinUpgradeVersion.Version,
-			ReleaseDate: nvUpgradeInfo.MinUpgradeVersion.ReleaseDate,
-			Tag:         nvUpgradeInfo.MinUpgradeVersion.Tag,
-		}
-	}
-	if nvUpgradeInfo.MaxUpgradeVersion != empty {
-		upgradeInfo.MaxUpgradeVersion = &api.RESTUpgradeInfo{
-			Version:     nvUpgradeInfo.MaxUpgradeVersion.Version,
-			ReleaseDate: nvUpgradeInfo.MaxUpgradeVersion.ReleaseDate,
-			Tag:         nvUpgradeInfo.MaxUpgradeVersion.Tag,
-		}
-	}
-	if nvUpgradeInfo.MinUpgradeVersion == empty && nvUpgradeInfo.MaxUpgradeVersion == empty {
-		return nil
-	}
-
-	return upgradeInfo
-}
 
 func getAcceptableAlerts(acc *access.AccessControl, login *loginSession) ([]string, []string, []string, []string, []string, map[string]string, utils.Set) {
 	var clusterRoleErrors, clusterRoleBindingErrors, roleErrors, roleBindingErrors, nvCrdSchemaErrors []string
@@ -2349,10 +2463,18 @@ func getAcceptableAlerts(acc *access.AccessControl, login *loginSession) ([]stri
 	}
 
 	var accepted []string
-	if user, _, _ := clusHelper.GetUserRev(common.ReservedNvSystemUser, access.NewReaderAccessControl()); user != nil {
+	user, _, err := clusHelper.GetUserRev(common.ReservedNvSystemUser, access.NewReaderAccessControl())
+	if err != nil {
+		log.WithError(err).Warn("failed to get system user")
+	}
+	if user != nil {
 		accepted = user.AcceptedAlerts
 	}
-	if user, _, _ := clusHelper.GetUserRev(login.fullname, acc); user != nil {
+	user, _, err = clusHelper.GetUserRev(login.fullname, acc)
+	if err != nil {
+		log.WithError(err).Warn("failed to get user")
+	}
+	if user != nil {
 		accepted = append(accepted, user.AcceptedAlerts...)
 	}
 	acceptedAlerts := utils.NewSetFromStringSlice(accepted)
@@ -2471,16 +2593,7 @@ func handlerSystemGetAlerts(w http.ResponseWriter, r *http.Request, ps httproute
 		return
 	}
 
-	var resp api.RESTNvAlerts = api.RESTNvAlerts{
-		NvUpgradeInfo: &api.RESTCheckUpgradeInfo{},
-	}
-
-	// populate neuvector_upgrade_info
-	if nvUpgradeInfo := getNvUpgradeInfo(); nvUpgradeInfo != nil {
-		resp.NvUpgradeInfo = nvUpgradeInfo
-	} else {
-		resp.NvUpgradeInfo = nil
-	}
+	var resp api.RESTNvAlerts
 
 	// populate acceptable_alerts
 	clusterRoleAlerts, clusterRoleBindingAlerts, roleAlerts, roleBindingAlerts, nvCrdSchemaAlerts, otherAlerts, acceptedAlerts := getAcceptableAlerts(acc, login)
@@ -2606,7 +2719,11 @@ func multipartExport(w http.ResponseWriter, sections utils.Set) error {
 	h := make(textproto.MIMEHeader)
 	h.Set("Content-Disposition", fmt.Sprintf("form-data; name=\"%s\"; filename=\"%s\"", multipartConfigName, filename))
 	h.Set("Content-Type", "application/x-gzip")
-	cfgw, _ := mpw.CreatePart(h)
+	cfgw, err := mpw.CreatePart(h)
+	if err != nil {
+		log.WithError(err).Warn("failed to create multipart form section")
+		return err
+	}
 
 	gzw := gzip.NewWriter(cfgw)
 	defer gzw.Close()
@@ -2808,7 +2925,10 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 
 	importRunning := false
 	importNoResponse := false
-	importTask, _ := clusHelper.GetImportTask()
+	importTask, err := clusHelper.GetImportTask()
+	if err != nil {
+		log.WithError(err).Warn("failed to get import task status")
+	}
 	if importTask.TID != "" && (importTask.Status == share.IMPORT_PREPARE || importTask.Status == share.IMPORT_RUNNING) {
 		importRunning = true
 		if !importTask.LastUpdateTime.IsZero() && time.Now().UTC().Sub(importTask.LastUpdateTime).Seconds() > share.IMPORT_QUERY_INTERVAL {
@@ -2891,8 +3011,15 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 
 	var tmpfile *os.File
 	if tmpfile, err = os.CreateTemp(importBackupDir, tempFilePrefix); err == nil {
+		tid, err := utils.GetRandomID(tidLength, "")
+		if err != nil {
+			errMsg := "failed to generate task id"
+			log.WithFields(log.Fields{"err": err}).Error(errMsg)
+			restRespErrorMessage(w, http.StatusInternalServerError, api.RESTErrFailImport, errMsg)
+			return
+		}
 		importTask := share.CLUSImportTask{
-			TID:            utils.GetRandomID(tidLength, ""),
+			TID:            tid,
 			ImportType:     importType,
 			Scope:          scope,
 			CtrlerID:       localDev.Ctrler.ID,
@@ -2936,7 +3063,10 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 			importTask.TotalLines = lines
 			importTask.Percentage = 3
 			importTask.LastUpdateTime = time.Now().UTC()
-			_ = clusHelper.PutImportTask(&importTask) // Ignore error because progress update is non-critical
+			if putErr := clusHelper.PutImportTask(&importTask); putErr != nil {
+				// Ignore error: progress update is non-critical
+				log.WithError(putErr).Debug("failed to update import task progress")
+			}
 			kv.SetImporting(1)
 			eps := cacher.GetAllControllerRPCEndpoints(access.NewReaderAccessControl())
 			switch importType {
@@ -2950,7 +3080,11 @@ func _importHandler(w http.ResponseWriter, r *http.Request, tid, importType, tem
 				_, tempToken, _, err = jwtGenerateToken(user, domainRoles, nil, login.remote, login.mainSessionID, "", nil)
 				if err == nil {
 					value := r.Header.Get("X-As-Standalone")
-					ignoreFed, _ := strconv.ParseBool(value)
+					ignoreFed, err := strconv.ParseBool(value)
+					if err != nil && value != "" {
+						// Suppress error: absent header is expected; only log when value is malformed
+						log.WithError(err).Warn("failed to parse X-As-Standalone header, defaulting to false")
+					}
 					go func() {
 						if err := cfgHelper.Import(eps, localDev.Ctrler.ID, localDev.Ctrler.ClusterIP, login.domainRoles, importTask,
 							tempToken, revertFedRoles, postImportOp, rpc.PauseResumeStoreWatcher, ignoreFed); err != nil {
@@ -3074,7 +3208,10 @@ func handlerConfigImport(w http.ResponseWriter, r *http.Request, ps httprouter.P
 		restRespAccessDenied(w, login)
 		return
 	} else if tid == "" && acc.HasGlobalPermissions(share.PERM_SYSTEM_CONFIG, share.PERM_SYSTEM_CONFIG) {
-		fedRole, _ := cacher.GetFedMembershipRole(acc)
+		fedRole, err := cacher.GetFedMembershipRole(acc)
+		if err != nil {
+			log.WithError(err).Warn("failed to get federation membership role")
+		}
 		if fedRole == api.FedRoleMaster && !acc.IsFedAdmin() {
 			restRespAccessDenied(w, login)
 			return
@@ -3304,7 +3441,10 @@ func handlerFedConfigExport(w http.ResponseWriter, r *http.Request, ps httproute
 	}
 
 	var rconf api.RESTFedConfigExport
-	body, _ := io.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.WithError(err).Warn("failed to read request body")
+	}
 	err = json.Unmarshal(body, &rconf)
 	if err != nil {
 		log.WithFields(log.Fields{"error": err}).Error("Request error")
@@ -3327,13 +3467,19 @@ func handlerFedConfigExport(w http.ResponseWriter, r *http.Request, ps httproute
 	if cconf := cacher.GetFedSystemConfig(access.NewFedAdminAccessControl()); cconf != nil {
 		webhooks = make([]api.RESTCrdFedWebHook, 0, len(cconf.Webhooks))
 		for _, wh := range cconf.Webhooks {
-			webhooks = append(webhooks, api.RESTCrdFedWebHook{
+			webhook := api.RESTCrdFedWebHook{
 				Name:     wh.Name,
 				Url:      wh.Url,
 				Enable:   wh.Enable,
 				UseProxy: wh.UseProxy,
+				Username: wh.Username,
 				Type:     wh.Type,
-			})
+			}
+			webhook.Password, err = common.AesGcmEncrypt(wh.Password)
+			if err != nil && wh.Password != "" {
+				log.WithFields(log.Fields{"err": err, "wh": wh.Name}).Warn("failed to encrypt password")
+			}
+			webhooks = append(webhooks, webhook)
 		}
 	}
 	resp.Spec = resource.NvCrdFedConfigSpec{
@@ -3351,7 +3497,10 @@ func importFedConfig(loginDomainRoles access.DomainRole, importTask share.CLUSIm
 	log.Debug()
 	defer os.Remove(importTask.TempFilename)
 
-	json_data, _ := os.ReadFile(importTask.TempFilename)
+	json_data, readErr := os.ReadFile(importTask.TempFilename)
+	if readErr != nil {
+		log.WithError(readErr).Warn("failed to read import file")
+	}
 	var secRule resource.NvCrdFedConfigSecurityRule
 	if err := json.Unmarshal(json_data, &secRule); err != nil || secRule.APIVersion != "neuvector.com/v1" || secRule.Kind != resource.NvConfigSecurityRuleKind {
 		msg := "Invalid security rule(s)"
@@ -3362,15 +3511,18 @@ func importFedConfig(loginDomainRoles access.DomainRole, importTask share.CLUSIm
 
 	var inc float32
 	var progress float32 // progress percentage
+	var err error
 
 	inc = 90.0 / float32(3)
 	progress = 6
 
 	importTask.Percentage = int(progress)
 	importTask.Status = share.IMPORT_RUNNING
-	_ = clusHelper.PutImportTask(&importTask) // Ignore error because progress update is non-critical
+	if putErr := clusHelper.PutImportTask(&importTask); putErr != nil {
+		// Ignore error: progress update is non-critical
+		log.WithError(putErr).Debug("failed to update import task progress")
+	}
 
-	var err error
 	var crdHandler nvCrdHandler
 	crdHandler.Init(share.CLUSLockServerKey, importCallerRest)
 	if crdHandler.AcquireLock(clusterLockWait) {
@@ -3390,7 +3542,10 @@ func importFedConfig(loginDomainRoles access.DomainRole, importTask share.CLUSIm
 
 		progress += inc
 		importTask.Percentage = int(progress)
-		_ = clusHelper.PutImportTask(&importTask) // Ignore error because progress update is non-critical
+		if putErr := clusHelper.PutImportTask(&importTask); putErr != nil {
+			// Ignore error: progress update is non-critical
+			log.WithError(putErr).Debug("failed to update import task progress")
+		}
 
 		cacheRecord := share.CLUSCrdSecurityRule{
 			ResponseRules: &share.CLUSCrdResponseRules{},
@@ -3402,7 +3557,10 @@ func importFedConfig(loginDomainRoles access.DomainRole, importTask share.CLUSIm
 		}
 
 		importTask.Percentage = 90
-		_ = clusHelper.PutImportTask(&importTask) // Ignore error because progress update is non-critical
+		if err := clusHelper.PutImportTask(&importTask); err != nil {
+			// Suppress error: progress update is non-critical
+			log.WithError(err).Debug("failed to update import task progress")
+		}
 
 		if err == nil && importTask.Scope == share.ScopeFed {
 			updateFedRulesRevision([]string{share.FedSystemConfigType}, acc, login)

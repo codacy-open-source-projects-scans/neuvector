@@ -115,6 +115,7 @@ func (ss *ScanService) ScanGetFiles(ctx context.Context, req *share.ScanRunningR
 		ObjType:      req.Type,
 		PidHost:      pidHost,
 		K8sAppString: k8sAppString,
+		ParsingCaps:  req.ParsingCaps,
 	}
 
 	bytesValue, _, err := walkerTask.Run(taskReq, req.ID)
@@ -185,7 +186,10 @@ func createControllerAgentServiceWrapper(conn *grpc.ClientConn) cluster.Service 
 }
 
 func getControllerServiceClient() (share.ControllerAgentServiceClient, error) {
-	ctrlEndpoint := getLeadGRPCEndpoint()
+	ctrlEndpoint, err := getLeadGRPCEndpoint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get lead controller endpoint: %w", err)
+	}
 	log.WithFields(log.Fields{"endpoint": ctrlEndpoint}).Debug("")
 
 	if ctrlEndpoint == "" {

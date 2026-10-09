@@ -75,7 +75,10 @@ func handleldapcfg(yaml_data []byte, load bool, skip *bool, context *configMapHa
 		context.gotAllCustomRoles = true
 	}
 
-	cs, _, _ := clusHelper.GetServerRev(name, accAdmin)
+	cs, _, err := clusHelper.GetServerRev(name, accAdmin)
+	if err != nil {
+		log.WithError(err).Warn("failed to get LDAP server rev")
+	}
 	if cs == nil {
 		cldap := &share.CLUSServerLDAP{
 			Port: DefaultLDAPServerPort,
@@ -135,7 +138,10 @@ func handlesamlcfg(yaml_data []byte, load bool, skip *bool, context *configMapHa
 		context.gotAllCustomRoles = true
 	}
 
-	cs, _, _ := clusHelper.GetServerRev(name, accAdmin)
+	cs, _, err := clusHelper.GetServerRev(name, accAdmin)
+	if err != nil {
+		log.WithError(err).Warn("failed to get SAML server rev")
+	}
 	if cs == nil {
 		csaml := &share.CLUSServerSAML{
 			CLUSServerAuth: share.CLUSServerAuth{
@@ -195,10 +201,13 @@ func handleoidccfg(yaml_data []byte, load bool, skip *bool, context *configMapHa
 	}
 
 	if remoteAuther == nil {
-		remoteAuther = auth.NewRemoteAuther(nil)
+		remoteAuther = auth.NewRemoteAuther(nil, common.AesGcmEncrypt, common.AesGcmDecrypt)
 	}
 
-	cs, _, _ := clusHelper.GetServerRev(name, accAdmin)
+	cs, _, err := clusHelper.GetServerRev(name, accAdmin)
+	if err != nil {
+		log.WithError(err).Warn("failed to get OIDC server rev")
+	}
 	if cs == nil {
 		coidc := &share.CLUSServerOIDC{
 			Scopes: auth.DefaultOIDCScopes,
@@ -325,7 +334,11 @@ func handlesystemcfg(yaml_data []byte, load bool, skip *bool, context *configMap
 			log.WithFields(log.Fields{"err": err2}).Error("applyScanConfigUpdates error")
 			return err2
 		}
-		value, _ := json.Marshal(cconf)
+		value, err2 := json.Marshal(cconf)
+		if err2 != nil {
+			log.WithError(err2).Warn("failed to marshal scan config")
+			return err2
+		}
 		err = cluster.Put(share.CLUSConfigScanKey, value)
 	}
 
@@ -379,7 +392,10 @@ func handlecustomrolecfg(yaml_data []byte, load bool, skip *bool, context *confi
 			}
 		}
 		var newrole bool
-		role, rev, _ := clusHelper.GetCustomRoleRev(rrole.Name, accAdmin)
+		role, rev, err := clusHelper.GetCustomRoleRev(rrole.Name, accAdmin)
+		if err != nil {
+			log.WithFields(log.Fields{"error": err, "name": rrole.Name}).Warn("Failed to get custom role")
+		}
 		if role == nil {
 			roledata := share.CLUSUserRole{Name: rrole.Name}
 			role = &roledata
@@ -475,7 +491,11 @@ func updateAdminPass(ruser *api.RESTUser, acc *access.AccessControl) {
 	}
 	empty := share.CLUSPwdProfile{}
 	if profile == empty {
-		if pprofile, _, _ := clusHelper.GetPwdProfileRev(share.CLUSDefPwdProfileName, acc); pprofile != nil {
+		pprofile, _, err := clusHelper.GetPwdProfileRev(share.CLUSDefPwdProfileName, acc)
+		if err != nil {
+			log.WithFields(log.Fields{"error": err}).Warn("Failed to get default password profile")
+		}
+		if pprofile != nil {
 			profile = *pprofile
 		}
 	}
@@ -580,7 +600,10 @@ func handlepwdprofilecfg(yaml_data []byte, load bool, skip *bool, context *confi
 			continue
 		}
 		var newprofile bool
-		profile, rev, _ := clusHelper.GetPwdProfileRev(rprofile.Name, accAdmin)
+		profile, rev, err := clusHelper.GetPwdProfileRev(rprofile.Name, accAdmin)
+		if err != nil {
+			log.WithFields(log.Fields{"error": err, "name": rprofile.Name}).Warn("Failed to get password profile")
+		}
 		if profile == nil {
 			profiledata := share.CLUSPwdProfile{
 				Name: rprofile.Name,
@@ -726,7 +749,10 @@ func handleusercfg(yaml_data []byte, load bool, skip *bool, context *configMapHa
 
 		var newuser bool
 		username := ruser.Fullname
-		user, rev, _ := clusHelper.GetUserRev(username, accAdmin)
+		user, rev, err := clusHelper.GetUserRev(username, accAdmin)
+		if err != nil {
+			log.WithError(err).Warn("Failed to get user rev from cluster")
+		}
 		if user == nil {
 			userdata := share.CLUSUser{
 				Fullname:    utils.MakeUserFullname("", username),
@@ -880,7 +906,7 @@ func LoadInitCfg(load bool, platform string) bool {
 	var loaded, failed []string
 	var defAdminLoaded bool
 	var skip bool
-	// After that if configmap have license it will overwrite the consol and eventually write back to .lc
+
 	type configMap struct {
 		FileName    string
 		Type        string
@@ -1118,10 +1144,12 @@ func handlefedcfg(yaml_data []byte, isLead bool) (string, error) {
 			} else {
 				_fixedJoinToken = rconf.JoinToken
 				reqData := api.RESTFedPromoteReqData{
-					Name:               rconf.ClusterName,
-					MasterRestInfo:     &rconf.PrimaryRestInfo,
-					UseProxy:           &rconf.UseProxy,
-					DeployRepoScanData: rconf.DeployRepoScanData,
+					Name:                  rconf.ClusterName,
+					MasterRestInfo:        &rconf.PrimaryRestInfo,
+					UseProxy:              &rconf.UseProxy,
+					FixedJoinToken:        &rconf.JoinToken,
+					AllowSameK8sUidRejoin: &rconf.AllowSameK8sUidRejoin,
+					DeployRepoScanData:    rconf.DeployRepoScanData,
 				}
 				if _, _, _, err = promoteToMaster(nil, acc, &login, reqData); err != nil {
 					log.WithFields(log.Fields{"err": err}).Debug("promote")

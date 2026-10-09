@@ -97,10 +97,18 @@ func (s *Syslogger) Send(elog interface{}, level, cat, header string) error {
 
 	var err error
 	if s.inJSON {
-		if data, _ := json.Marshal(elog); len(data) > 2 {
+		var data []byte
+		data, err = json.Marshal(elog)
+		if err != nil {
+			// Log locally rather than returning: callers (sendSyslog) treat any returned
+			// error as a network failure and trigger a 30-minute suppression window.
+			log.WithError(err).Warn("failed to marshal event log for syslog")
+			return nil
+		}
+		if len(data) > 2 {
 			logText := fmt.Sprintf("{\"%s\": \"%s\", %s", notificationHeader, header, string(data[1:][:]))
 			if s.stdin {
-				fmt.Println(logText)
+				log.Info(logText)
 			}
 			if s.syslog {
 				err = s.sendWithTimeout(logText, prio, syslogTimeout)
@@ -110,7 +118,7 @@ func (s *Syslogger) Send(elog interface{}, level, cat, header string) error {
 		if logText := struct2Text(elog); logText != "" {
 			logText = fmt.Sprintf("%s=%s,%s", notificationHeader, header, logText)
 			if s.stdin {
-				fmt.Println(logText)
+				log.Info(logText)
 			}
 			if s.syslog {
 				err = s.sendWithTimeout(logText, prio, syslogTimeout)
@@ -252,14 +260,18 @@ const ctypeText = "text/plain; charset=us-ascii"
 const ctypeJSON = "application/json"
 
 type Webhook struct {
-	url    string
-	target string
+	url      string
+	target   string
+	userName string
+	password string
 }
 
-func NewWebHook(url, target string) *Webhook {
+func NewWebHook(url, target, userName, password string) *Webhook {
 	w := &Webhook{
-		url:    url,
-		target: target,
+		url:      url,
+		target:   target,
+		userName: userName,
+		password: password,
 	}
 	return w
 }
@@ -318,7 +330,7 @@ func getDetailInfoFromLog(elog interface{}) string {
 	for _, fieldName := range fieldOrder {
 		value, err := getFieldStringValue(elog, fieldName)
 		if err == nil {
-			builder.WriteString(fmt.Sprintf("%s: %s, ", fieldNames[fieldName], value))
+			fmt.Fprintf(&builder, "%s: %s, ", fieldNames[fieldName], value)
 		} else {
 			log.WithFields(log.Fields{"err": err, "elog": elog}).Debug("Error when get detail info from elog")
 		}
@@ -363,7 +375,12 @@ func (w *Webhook) Notify(elog interface{}, level, category, cluster, title, comm
 			fields := make(map[string]string)
 			fields["text"] = logText
 			fields["username"] = fmt.Sprintf("NeuVector - %s", cluster)
-			data, _ = json.Marshal(fields)
+			var err error
+			data, err = json.Marshal(fields)
+			if err != nil {
+				log.WithError(err).Warn("failed to marshal Slack webhook payload")
+				return
+			}
 		case api.WebhookTypeTeams:
 			ctype = ctypeJSON
 			fields := make(map[string]string)
@@ -378,7 +395,12 @@ func (w *Webhook) Notify(elog interface{}, level, category, cluster, title, comm
 			fields["title"] = logheader
 			logText = fmt.Sprintf("%s=%s,%s", notificationHeader, category, logText)
 			fields["text"] = fmt.Sprintf("%s\n> %s", title, logText)
-			data, _ = json.Marshal(fields)
+			var err error
+			data, err = json.Marshal(fields)
+			if err != nil {
+				log.WithError(err).Warn("failed to marshal Teams webhook payload")
+				return
+			}
 		case api.WebhookTypeJSON:
 			ctype = ctypeJSON
 			var extra string
@@ -388,7 +410,12 @@ func (w *Webhook) Notify(elog interface{}, level, category, cluster, title, comm
 				extra = fmt.Sprintf("{\"cluster\":\"%s\",", cluster)
 			}
 
-			data, _ = json.Marshal(elog)
+			var err error
+			data, err = json.Marshal(elog)
+			if err != nil {
+				log.WithError(err).Warn("failed to marshal JSON webhook payload")
+				return
+			}
 			data = append([]byte(extra), data[1:]...)
 		default:
 			ctype = ctypeText
@@ -423,7 +450,14 @@ func (w *Webhook) httpRequest(data []byte, ctype string, proxy *share.CLUSProxy)
 	var resp *http.Response
 	retry := 0
 	for retry < 3 {
-		req, _ := http.NewRequest("POST", w.url, bytes.NewReader(data))
+		var req *http.Request
+		req, err = http.NewRequest("POST", w.url, bytes.NewReader(data))
+		if err != nil {
+			return fmt.Errorf("failed to create HTTP request: %w", err)
+		}
+		if w.userName != "" && w.password != "" {
+			req.SetBasicAuth(w.userName, w.password)
+		}
 		req.Header.Set("Content-Type", ctype)
 
 		resp, err = client.Do(req)

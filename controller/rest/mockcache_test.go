@@ -29,6 +29,10 @@ func (m *MockCache) GetRiskScoreMetrics(acc, accCaller *access.AccessControl) *a
 	return nil
 }
 
+func (m *MockCache) SendExposureReport(acc, accCaller *access.AccessControl, domain string) error {
+	return nil
+}
+
 func (m *MockCache) GetAllHosts(acc *access.AccessControl) []*api.RESTHost {
 	return nil
 }
@@ -407,10 +411,6 @@ func (m *MockCache) GetAudits(acc *access.AccessControl) []*api.Audit {
 
 func (m *MockCache) GetAuditCount(acc *access.AccessControl) int {
 	return 0
-}
-
-func (m *MockCache) GetCurrentLicense(acc *access.AccessControl) api.RESTLicenseInfo {
-	return api.RESTLicenseInfo{}
 }
 
 func (m *MockCache) GetProcessProfile(group string, acc *access.AccessControl) (*api.RESTProcessProfile, error) {
